@@ -234,10 +234,16 @@ validation_report.loc[model_mask, "PR_AUC_Rank"] = validation_report.loc[model_m
 validation_report.loc[model_mask, "Brier_Rank"] = validation_report.loc[model_mask, "Brier_Score"].rank(ascending=True, method="average")
 validation_report.loc[model_mask, "Combined_Rank"] = validation_report.loc[model_mask, ["PR_AUC_Rank", "Brier_Rank"]].mean(axis=1)
 validation_report.to_csv(OUTPUT_DIR / "model_validation_comparison.csv", index=False)
-print("\nValidation comparison (models selected by mean PR-AUC/Brier rank):")
-print(validation_report.sort_values("Combined_Rank", na_position="last").to_string(index=False))
+print("\nValidation comparison (models selected by mean PR-AUC/Brier rank, then PR-AUC):")
+print(validation_report.sort_values(
+    ["Combined_Rank", "PR_AUC", "Brier_Score"],
+    ascending=[True, False, True], na_position="last",
+).to_string(index=False))
 
-ml_report = validation_report[model_mask].sort_values("Combined_Rank")
+ml_report = validation_report[model_mask].sort_values(
+    ["Combined_Rank", "PR_AUC", "Brier_Score"],
+    ascending=[True, False, True],
+)
 best_name = str(ml_report.iloc[0]["Model"])
 print("\nSelected model:", best_name)
 
