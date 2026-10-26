@@ -53,22 +53,30 @@ p = dedup["Predicted_Failure_Probability"].to_numpy()
 
 if len(np.unique(y)) < 2:
     raise ValueError("Evaluation requires both target classes.")
+# Expanded evaluation metrics to cover Top 5%, Top 10% (Red Tier), 
+# and Top 20% (Yellow Tier) to directly match the operational tiers in our app.
+def get_top_k_metrics(y_true, scores, pct):
+    k = max(1, int(np.ceil(pct * len(y_true))))
+    top_idx = np.argsort(scores)[::-1][:k]
+    positives = max(1, y_true.sum())
+    return {
+        f"Precision_At_Top_{int(pct*100)}pct": float(y_true[top_idx].mean()),
+        f"Recall_At_Top_{int(pct*100)}pct": float(y_true[top_idx].sum() / positives),
+    }
 
-k = max(1, int(np.ceil(0.05 * len(dedup))))
-top_idx = np.argsort(p)[::-1][:k]
-
-report = pd.DataFrame([{
+report_dict = {
     "Rows": len(dedup),
     "Unique_Restaurants": dedup["Restaurant_ID"].nunique(),
-    "Failure_Rate": y.mean(),
+    "Base_Failure_Rate": float(y.mean()),
     "PR_AUC": average_precision_score(y, p),
     "ROC_AUC": roc_auc_score(y, p),
     "Brier_Score": brier_score_loss(y, p),
-    "Top_5pct_Count": k,
-    "Precision_At_Top_5pct": y[top_idx].mean(),
-    "Recall_At_Top_5pct": y[top_idx].sum() / max(1, y.sum()),
-}])
+}
 
+for pct in [0.05, 0.10, 0.20]:
+    report_dict.update(get_top_k_metrics(y, p, pct))
+
+report = pd.DataFrame([report_dict])
 print(report.to_string(index=False))
 report.to_csv(OUTPUT_PATH, index=False)
 print("\nSaved:", OUTPUT_PATH)

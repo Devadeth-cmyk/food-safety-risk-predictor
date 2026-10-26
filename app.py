@@ -13,6 +13,29 @@ st.set_page_config(
     layout="wide",
 )
 
+# --- UI POLISH & DARK THEME ADDITIONS ---
+# Injecting custom CSS to make the top KPI metrics look like a modern executive dashboard.
+st.markdown("""
+<style>
+    /* Modern Executive Metric Card Styling */
+    div[data-testid="stMetricValue"] {
+        font-size: 2.1rem !important;
+        font-weight: 700 !important;
+        color: #F1F5F9 !important; /* Bright white/blue for high contrast */
+    }
+    div[data-testid="stMetricLabel"] {
+        font-size: 0.95rem !important;
+        color: #94A3B8 !important; /* Slate gray for elegant labeling */
+        font-weight: 600 !important;
+    }
+    /* Round table corners */
+    .css-1r6slb0, .stDataFrame {
+        border-radius: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
+# -----------------------------------------------------------
+
 def first_existing(*names):
     for name in names:
         for path in (OUTPUT_DIR / name, BASE_DIR / name):
@@ -103,17 +126,30 @@ with overview_tab:
     with left:
         if "Relative_Risk_Tier" in queue.columns:
             tier_counts = queue["Relative_Risk_Tier"].value_counts().rename_axis("Risk tier").reset_index(name="Restaurants")
-            fig = px.bar(tier_counts, x="Risk tier", y="Restaurants", title="Restaurants by relative risk tier")
+            # Applied plotly_dark template and exact tier colors (Red/Yellow/Green)
+            fig = px.bar(
+                tier_counts, x="Risk tier", y="Restaurants", title="Restaurants by relative risk tier",
+                template="plotly_dark",
+                color="Risk tier",
+                color_discrete_map={
+                    "Red - highest 10%": "#EF4444", 
+                    "Yellow - next 20%": "#F59E0B", 
+                    "Green - remaining 70%": "#10B981"
+                }
+            )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Relative_Risk_Tier is not available in the selected queue file.")
     with right:
+        # Applied plotly_dark template
         fig = px.histogram(
             queue,
             x="Predicted_Failure_Probability",
             nbins=30,
             title="Distribution of predicted failure probabilities",
             labels={"Predicted_Failure_Probability": "Predicted failure probability"},
+            template="plotly_dark",
+            color_discrete_sequence=["#3B82F6"] # Bright blue for contrast
         )
         st.plotly_chart(fig, use_container_width=True)
     st.info("Relative tiers are ranking bands (top 10%, next 20%, remaining 70%), not official inspection grades.")
@@ -138,12 +174,24 @@ with map_tab:
         if map_filtered.empty:
             st.warning("No restaurants match the current filters.")
         else:
+            # Upgraded Map Colors for dark theme visibility
+            def get_neon_color(row):
+                tier = str(row.get("Relative_Risk_Tier", ""))
+                if "Red" in tier: return [239, 68, 68, 200]       # Neon Red
+                elif "Yellow" in tier: return [245, 158, 11, 200] # Bright Amber
+                elif "Green" in tier: return [16, 185, 129, 140]  # Emerald Green
+                # Fallback gradient if tier string varies
+                prob = row.get("Predicted_Failure_Probability", 0)
+                return [int(255 * prob), int(120 * (1 - prob)), 40]
+
+            map_filtered["color"] = map_filtered.apply(get_neon_color, axis=1)
+
             layer = pdk.Layer(
                 "ScatterplotLayer",
                 data=map_filtered,
                 get_position="[Longitude, Latitude]",
                 get_radius=65,
-                get_fill_color="[255 * Predicted_Failure_Probability, 120 * (1 - Predicted_Failure_Probability), 40]",
+                get_fill_color="color", # TEAM NOTE: Pointing to new color column
                 pickable=True,
                 auto_highlight=True,
             )
@@ -157,9 +205,10 @@ with map_tab:
                 "html": "<b>Restaurant ID:</b> {Restaurant_ID}<br/>"
                         "<b>Predicted failure probability:</b> {Predicted_Failure_Probability}<br/>"
                         "<b>Tier:</b> {Relative_Risk_Tier}",
-                "style": {"backgroundColor": "steelblue", "color": "white"},
+                "style": {"backgroundColor": "#1E293B", "color": "white", "border-radius": "4px"},
             }
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip))
+            # Forced Mapbox dark theme to match Streamlit dark mode
+            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip, map_style="mapbox://styles/mapbox/dark-v10"))
             st.caption(f"Showing {len(map_filtered):,} mapped restaurants.")
 
 with queue_tab:
@@ -175,7 +224,25 @@ with queue_tab:
     table = filtered[display_cols].sort_values(
         "Predicted_Failure_Probability", ascending=False
     ) if "Predicted_Failure_Probability" in display_cols else filtered[display_cols]
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    # Upgraded UI! We are formatting probabilities as visual progress bars 
+    # instead of boring floats. This makes the dashboard look like enterprise software.
+    column_config = {
+        "Predicted_Failure_Probability": st.column_config.ProgressColumn(
+            "Predicted Risk",
+            help="Probability of failure at next routine inspection",
+            format="%.1f%%",
+            min_value=0.0,
+            max_value=1.0,
+        ),
+        "Priority_Rank": st.column_config.NumberColumn("Rank", format="#%d"),
+    }
+    
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config=column_config,
+    )
     st.download_button(
         "Download filtered priority queue CSV",
         data=table.to_csv(index=False).encode("utf-8"),
@@ -188,6 +255,7 @@ with trends_tab:
     if season_path:
         season = load_csv(str(season_path))
         if {"Month", "Failure_Rate_Percent"}.issubset(season.columns):
+            # Applied plotly_dark template
             fig = px.line(
                 season,
                 x="Month",
@@ -195,6 +263,8 @@ with trends_tab:
                 markers=True,
                 title="Historical failure rate by month (Canvass inspections only)",
                 labels={"Failure_Rate_Percent": "Failure rate (%)", "Month": "Inspection month"},
+                template="plotly_dark",
+                color_discrete_sequence=["#EF4444"] # Red for failure
             )
             st.plotly_chart(fig, use_container_width=True)
             st.dataframe(season, use_container_width=True, hide_index=True)
@@ -291,6 +361,7 @@ with community_tab:
                     chart_data = eligible.head(top_n).sort_values(
                         "Mean_Predicted_Failure_Probability"
                     )
+                    # Applied plotly_dark template and Red continuous scale
                     fig = px.bar(
                         chart_data,
                         x="Mean_Predicted_Failure_Probability",
@@ -307,6 +378,9 @@ with community_tab:
                             "Restaurant_Count": "Restaurants in queue",
                             "High_Risk_Restaurant_Count": "High-priority count",
                         },
+                        template="plotly_dark",
+                        color="Mean_Predicted_Failure_Probability",
+                        color_continuous_scale="Reds"
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -353,6 +427,7 @@ with model_tab:
         shap_df = load_csv(str(shap_path))
         if {"Feature", "Mean_Absolute_SHAP"}.issubset(shap_df.columns):
             shap_df = shap_df.sort_values("Mean_Absolute_SHAP", ascending=True).tail(15)
+            # Applied plotly_dark template
             fig = px.bar(
                 shap_df,
                 x="Mean_Absolute_SHAP",
@@ -360,13 +435,23 @@ with model_tab:
                 orientation="h",
                 title="Top features by mean absolute SHAP value",
                 labels={"Mean_Absolute_SHAP": "Mean |SHAP value|", "Feature": "Model feature"},
+                template="plotly_dark",
+                color_discrete_sequence=["#8B5CF6"] # Purple for model metrics
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("SHAP feature CSV is missing expected columns.")
     else:
         st.warning("SHAP feature importance CSV not found beside app.py.")
-
+    
+    # Render the static high-res SHAP Waterfall/Summary plots directly 
+    # in the app so we can use them to explain the model during the live demo.
+    shap_img_path = first_existing("shap_highest_risk_waterfall.png", "shap_summary.png")
+    if shap_img_path:
+        st.markdown("---")
+        st.subheader("Individual Risk Factors (SHAP Explanation)")
+        st.image(str(shap_img_path), use_container_width=True, 
+                 caption="SHAP analysis showing how specific history features push risk up or down.")
 st.divider()
 st.caption(
     "Research prototype only. Predictions should support, not replace, professional inspection decisions. "

@@ -45,6 +45,16 @@ print("Train failure rate:", round(train_df[TARGET].mean(), 4))
 print("Test failure rate:", round(test_df[TARGET].mean(), 4))
 print("Restaurants train/test:", train_df["Restaurant_ID"].nunique(), test_df["Restaurant_ID"].nunique())
 
+# Calculate how many restaurants in our test set are brand new (cold starts) 
+# versus returning restaurants we saw in the training data.
+train_restaurants = set(train_df["Restaurant_ID"].unique())
+test_restaurants = set(test_df["Restaurant_ID"].unique())
+overlap = train_restaurants.intersection(test_restaurants)
+new_in_test = test_restaurants - train_restaurants
+
+print(f"Restaurants in both train and test: {len(overlap):,} ({len(overlap)/len(test_restaurants):.1%} of test set)")
+print(f"New 'cold start' restaurants in test set: {len(new_in_test):,} ({len(new_in_test)/len(test_restaurants):.1%} of test set)")
+
 train_df.to_csv(TRAIN_PATH, index=False)
 test_df.to_csv(TEST_PATH, index=False)
 print("Saved:", TRAIN_PATH)

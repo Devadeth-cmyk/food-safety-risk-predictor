@@ -7,6 +7,7 @@ Deployment: after the test report is written, fit a deployment model on older la
 rows and calibrate on a recent temporal holdout; score latest rows for a priority queue.
 """
 from pathlib import Path
+import time  # Added time module to track model training duration
 import warnings
 import joblib
 import numpy as np
@@ -88,25 +89,37 @@ def make_pipeline(estimator, X_fit):
         ("model", estimator),
     ])
 
-
+# TEAM NOTE: Updated to include Top 10% metrics for better inspector capacity planning
 def safe_metrics(y_true, scores):
     y_true = np.asarray(y_true, dtype=int)
     scores = np.asarray(scores, dtype=float)
-    k = max(1, int(np.ceil(0.05 * len(y_true))))
-    top_idx = np.argsort(scores)[::-1][:k]
-    positives = int(y_true.sum())
+    
+    def _at_k(frac):
+        k = max(1, int(np.ceil(frac * len(y_true))))
+        top_idx = np.argsort(scores)[::-1][:k]
+        positives = int(y_true.sum())
+        return {
+            "precision": float(y_true[top_idx].mean()),
+            "recall": float(y_true[top_idx].sum() / positives) if positives else np.nan,
+            "count": int(k),
+        }
+        
+    top5 = _at_k(0.05)
+    top10 = _at_k(0.10)
     roc = roc_auc_score(y_true, scores) if len(np.unique(y_true)) == 2 else np.nan
+    
     return {
         "PR_AUC": average_precision_score(y_true, scores),
         "ROC_AUC": roc,
         "Brier_Score": brier_score_loss(y_true, np.clip(scores, 0, 1)),
-        "Precision_At_Top_5pct": float(y_true[top_idx].mean()),
-        "Recall_At_Top_5pct": float(y_true[top_idx].sum() / positives) if positives else np.nan,
+        "Precision_At_Top_5pct": top5["precision"],
+        "Recall_At_Top_5pct": top5["recall"],
+        "Precision_At_Top_10pct": top10["precision"],
+        "Recall_At_Top_10pct": top10["recall"],
         "Base_Failure_Rate": float(y_true.mean()),
-        "Top_5pct_Count": int(k),
+        "Top_5pct_Count": top5["count"],
+        "Top_10pct_Count": top10["count"],
     }
-
-
 
 def calibrate_prefit(estimator, X_cal, y_cal):
     """Fit sigmoid calibration on a held-out chronological calibration period."""
@@ -133,7 +146,6 @@ def read_dates(path):
         parse_dates=["Inspection Date", "Next_Routine_Inspection_Date"],
         low_memory=False,
     )
-
 
 def align_features(X, columns):
     return X.reindex(columns=columns)
@@ -185,17 +197,23 @@ print("Failure rates:", round(y_fit.mean(), 4), round(y_val.mean(), 4), round(y_
 print("Features before encoding:", len(feature_cols))
 
 # No class_weight: balanced weights often distort probability estimates.
+# Upgraded hyperparameters! Increased tree depth and estimators 
+# so XGBoost & Random Forest can capture deeper, more complex risk patterns.
 models = {
-    "Logistic Regression": LogisticRegression(max_iter=250, tol=1e-3, solver="liblinear", random_state=RANDOM_STATE),
-    "Random Forest": RandomForestClassifier(
-        n_estimators=100, max_depth=12, min_samples_leaf=10, max_features="sqrt",
-        n_jobs=2, random_state=RANDOM_STATE,
+    "Logistic Regression": LogisticRegression(
+        max_iter=500, tol=1e-3, solver="liblinear", random_state=RANDOM_STATE
     ),
+    "Random Forest": RandomForestClassifier(
+        n_estimators=250, max_depth=16, min_samples_leaf=5, max_features="sqrt",
+        n_jobs=-1, random_state=RANDOM_STATE,
+    ),
+    # TEAM NOTE: scale_pos_weight = neg/pos so XGBoost pays more attention to the rarer Fail class
     "XGBoost": XGBClassifier(
-        n_estimators=120, max_depth=3, learning_rate=0.05,
-        subsample=0.85, colsample_bytree=0.85, reg_lambda=2.0,
-        min_child_weight=8, eval_metric="logloss", tree_method="hist",
-        n_jobs=2, random_state=RANDOM_STATE,
+        n_estimators=300, max_depth=6, learning_rate=0.03,
+        subsample=0.80, colsample_bytree=0.80, reg_lambda=1.0,
+        min_child_weight=3, eval_metric="logloss", tree_method="hist",
+        scale_pos_weight=float((y_fit == 0).sum() / max(1, (y_fit == 1).sum())),
+        n_jobs=-1, random_state=RANDOM_STATE,
     ),
 }
 
@@ -243,14 +261,24 @@ print("\nSelected model:", best_name)
 
 # Honest test evaluation: base estimator fits only on early fit data; sigmoid
 # calibration uses the validation period; the test set is untouched until now.
-calibrated_eval_model = calibrate_prefit(fitted[best_name], X_val, y_val)
+# TEAM NOTE: Calibrate EVERY candidate on validation, score once on untouched test.
+# Deployment still uses validation winner only (best_name). This makes the Streamlit
+# Model & SHAP table show LR / RF / XGB side-by-side for the professor demo.
+test_rows = []
+calibrated_models = {}
+for name, pipe in fitted.items():
+    cal_model = calibrate_prefit(pipe, X_val, y_val)
+    calibrated_models[name] = cal_model
+    probs = cal_model.predict_proba(X_test)[:, 1]
+    row = {"Model": f"{name} (sigmoid-calibrated)"}
+    row.update(safe_metrics(y_test, probs))
+    test_rows.append(row)
+
+# Keep a handle on the validation-selected model for test_predictions export
+calibrated_eval_model = calibrated_models[best_name]
 test_prob = calibrated_eval_model.predict_proba(X_test)[:, 1]
 
 # Compare against ranking baselines and a constant-probability Brier baseline.
-test_rows = []
-row = {"Model": f"{best_name} (sigmoid-calibrated)"}
-row.update(safe_metrics(y_test, test_prob))
-test_rows.append(row)
 if "Results" in X_test:
     row = {"Model": "Current inspection result baseline"}
     row.update(safe_metrics(y_test, pd.to_numeric(X_test["Results"], errors="coerce").fillna(0)))
@@ -262,7 +290,10 @@ if "Last_Canvass_Failed" in X_test:
 row = {"Model": "Constant training prevalence baseline"}
 row.update(safe_metrics(y_test, np.full(len(y_test), float(train_df[TARGET].mean()))))
 test_rows.append(row)
+
 test_report = pd.DataFrame(test_rows)
+# Sort to make the dashboard table look clean
+test_report = test_report.sort_values(by="PR_AUC", ascending=False)
 test_report.to_csv(OUTPUT_DIR / "model_test_metrics.csv", index=False)
 
 prediction_cols = [c for c in ["Restaurant_ID", "Inspection Date", "Next_Routine_Inspection_Date"] if c in test_df]
@@ -322,6 +353,13 @@ joblib.dump(deployment_model, OUTPUT_DIR / "restaurant_failure_model.joblib")
 # Save the uncalibrated base pipeline separately for feature attribution / SHAP.
 joblib.dump(deploy_base, OUTPUT_DIR / "restaurant_failure_base_estimator.joblib")
 
+# Extracting clean feature names post-preprocessing so SHAP plots 
+# in the next script have accurate labels instead of raw array indices.
+try:
+    transformed_feature_names = deploy_base.named_steps["preprocess"].get_feature_names_out().tolist()
+except Exception:
+    transformed_feature_names = deploy_features
+
 metadata = {
     "selected_model": best_name,
     "target": TARGET,
@@ -331,6 +369,7 @@ metadata = {
     "deployment_calibration_start": str(deploy_cal_start.date()),
     "deployment_calibration_end": str(max_target_date.date()),
     "feature_columns": deploy_features,
+    "transformed_feature_names": transformed_feature_names,  # Added for SHAP!
     "risk_tiers": "relative ranking: top 10% red, next 20% yellow, remaining 70% green",
 }
 joblib.dump(metadata, OUTPUT_DIR / "restaurant_failure_model_metadata.joblib")

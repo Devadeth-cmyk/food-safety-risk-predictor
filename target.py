@@ -11,12 +11,18 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 
+# Added PARENT_DIR to CANDIDATE_PATHS. 
+# This prevents FileNotFoundError if the terminal is opened in the wrong directory.
 BASE_DIR = Path(__file__).resolve().parent
+PARENT_DIR = BASE_DIR.parent
 OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
 CANDIDATE_PATHS = [
     BASE_DIR / "restaurant_feature_engineering_base.csv",
     BASE_DIR / "data" / "restaurant_feature_engineering_base.csv",
+    PARENT_DIR / "restaurant_feature_engineering_base.csv",
+    PARENT_DIR / "data" / "restaurant_feature_engineering_base.csv",
 ]
 RAW_PATH = next((p for p in CANDIDATE_PATHS if p.exists()), CANDIDATE_PATHS[0])
 TARGET_PATH = OUTPUT_DIR / "restaurant_target_prepared.csv"
@@ -100,7 +106,9 @@ for col, out_col in [
         if col == "Results":
             df[out_col] = prior_rolling_sum(df[col], 3).fillna(0)
         else:
-            df[out_col] = prior_rolling_mean(df[col], 3)
+            # Added .fillna(-1) to handle brand new restaurants. 
+            # -1 acts as an explicit "no prior history" signal for our XGBoost model.
+            df[out_col] = prior_rolling_mean(df[col], 3).fillna(-1)
 
 # Days since most recent failure, including the current result because it is known
 # after the current inspection event.
