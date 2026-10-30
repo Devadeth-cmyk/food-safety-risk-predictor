@@ -1,0 +1,32 @@
+RESTAURANT INSPECTION FAILURE - SHAP REPORT
+==================================================
+Model in metadata: HistGradientBoosting
+Estimator type: Pipeline
+Features explained: 55
+Explanation sample size: 60
+Highest predicted failure probability: 0.4407
+
+TOP 15 FEATURES BY MEAN ABSOLUTE SHAP VALUE
+--------------------------------------------------
+Days_Since_Previous_Inspection: 0.020717
+Previous_Failure_Count: 0.017255
+Hazard_Count: 0.013734
+Previous_Violation_Count: 0.013019
+Latitude: 0.011682
+Historical_Failure_Rate: 0.011460
+Inspection_Year: 0.010170
+Administrative_Count: 0.009099
+Longitude: 0.008324
+Violation_Count: 0.007652
+Inspection Type_canvass: 0.006190
+Inspection_Sequence: 0.005413
+Average_Violation_Score: 0.004932
+Compliant_Positive_Count: 0.004178
+Violation_Count_Change: 0.003436
+
+Interpretation:
+- Positive SHAP values push predicted failure probability upward.
+- Negative SHAP values push predicted failure probability downward.
+- Mean absolute SHAP measures average contribution magnitude.
+- SHAP describes model behavior; it does not prove causation.
+- Feature leakage and prediction-time availability require separate checks.
