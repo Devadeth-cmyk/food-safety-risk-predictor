@@ -1,222 +1,255 @@
-# 🍔 Chicago Restaurant Health Inspection Risk System
+# 🍔 Chicago Restaurant Health Inspection Risk Prediction System
 
-> **An AI-powered predictive decision-support system and interactive GIS risk map designed for city health inspectors and public safety managers.**
-
----
+An AI-powered decision-support system that predicts the likelihood of Chicago restaurants failing their next routine health inspection. The application helps inspection teams prioritize restaurants using machine learning, historical inspection data, geographic risk analysis, and explainable AI.
 
 ## 📌 Project Overview
 
-Traditional restaurant health inspection workflows often rely on static schedules or simple reactive heuristics (e.g., inspecting facilities that failed previously). This project builds a **point-in-time, leakage-free machine learning pipeline** to predict whether a Chicago restaurant will fail its **next routine (Canvass) health inspection** within a **1 to 548-day window** based *strictly on past compliance history*.
+Restaurant health inspections are essential for maintaining food safety and public health. However, inspection resources are limited, making it important to identify restaurants that may require closer attention.
 
-By prioritizing high-risk facilities, city health officers can allocate inspection resources far more efficiently—increasing failure detection rates prior to foodborne illness outbreaks.
+This project uses historical restaurant inspection data to estimate the probability of failure at a future routine (Canvass) inspection.
 
----
+The system presents these predictions through an interactive Streamlit dashboard, allowing users to explore restaurant-level risk, identify high-priority inspections, analyze neighborhood-level trends, and understand important model features.
 
-## ✨ Key Features & Interactive Dashboard Tabs
-
-The project includes an **8-tab interactive Streamlit web dashboard** with full **Light/Dark Mode responsive UI/UX**:
-
-1. **📊 Overview**: High-level KPI metrics, citywide risk distribution histograms, and priority tier breakdowns (Red: Top 10%, Yellow: Next 20%, Green: Remaining 70%).
-2. **🗺️ Interactive Risk Map**:
-   * **Standard 2D Scatter Mode**: Color-coded facility location markers.
-   * **3D Hexagon Density Mode**: Extruded 3D towers showing geographic risk concentration across Chicago neighborhoods (rendered with CartoDB tiles).
-3. **📋 Inspector Priority Queue**: Operational priority queue sorted by predicted failure probability, featuring progress bars and one-click CSV export.
-4. **🏢 Facility Profile & Report Card**: Facility lookup tool featuring a **Speedometer Risk Gauge Chart**, plain-English compliance history summary, localized map, and single-facility report download.
-5. **🧪 What-If ML Risk Simulator**: Interactive compliance simulator allowing managers to adjust sliders (violations, hazards, days since failure) and observe real-time model probability shifts.
-6. **📅 Seasonal Trends**: Monthly historical inspection failure analysis identifying seasonal spikes in food safety violations.
-7. **🏙️ Community Areas**: Chicago neighborhood-level risk aggregation with sample size filtering and area summary exports.
-8. **🧠 Model & SHAP Explainability**: Side-by-side model evaluation metrics table, global SHAP feature importance bar charts, and constrained individual waterfall plots explaining specific high-risk predictions.
+**The model provides risk estimates to support inspection planning. Predictions do not guarantee future inspection outcomes.**
 
 ---
 
-## 📈 Model Performance & Evaluation Results
+## ✨ Key Features
 
-All models were evaluated on an **untouched, held-out temporal test set** (inspections occurring post-August 4, 2022). Probability outputs were calibrated using **Sigmoid Calibration (Platt Scaling)** on a chronological validation holdout.
+### 1. Overview Dashboard
+- Displays overall inspection and risk summaries.
+- Provides a high-level view of restaurant risk.
+- Helps users understand the distribution of predicted risks.
 
-| Model / Baseline | PR-AUC ⬆️ | ROC-AUC ⬆️ | Brier Score ⬇️ | Precision @ Top 5% ⬆️ | Precision @ Top 10% ⬆️ |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Random Forest (sigmoid-calibrated)** 🏆 | **0.3796** | **0.6113** | **0.1988** | **46.48%** | **43.88%** |
-| **Logistic Regression (sigmoid-calibrated)** | 0.3702 | 0.5934 | 0.2003 | 47.27% | 43.18% |
-| **XGBoost (sigmoid-calibrated)** | 0.3522 | 0.5866 | 0.2022 | 41.64% | 38.69% |
-| *Last Canvass Result Baseline* | 0.3060 | 0.5376 | 0.3983 | 31.07% | 31.91% |
-| *Current Inspection Result Baseline* | 0.3008 | 0.5269 | 0.3737 | 31.95% | 32.57% |
-| *Constant Training Prevalence Baseline* | 0.2881 | 0.5000 | 0.2073 | 31.78% | 31.91% |
+### 2. Geographic Risk Map
+- Visualizes restaurant locations and predicted risks.
+- Helps identify geographic concentrations of higher-risk restaurants.
+- Uses PyDeck for geospatial visualization.
 
-### 💡 Key Takeaway:
-* **Base Citywide Failure Rate**: **~28.8%** (random inspection).
-* **Top 10% High-Priority Queue Precision**: **43.9%** (+52% efficiency boost over random selection).
-* **Top 5% High-Priority Queue Precision**: **46.5%** (+61% efficiency boost over random selection).
+### 3. Inspector Priority Queue
+- Ranks restaurants using predicted failure probability.
+- Displays restaurant ID, risk tier, predicted failure probability, inspection date, violation count, latitude, longitude, and inspection result.
+- Supports filtering restaurants using dashboard controls.
+- Helps inspectors identify restaurants that may require earlier attention.
+- Supports downloading the displayed queue as a CSV file.
+
+### 4. Restaurant Report Card
+- Allows users to search for a restaurant using its ID.
+- Displays predicted failure risk, risk tier, and priority rank.
+- Uses a gauge chart to visualize predicted failure probability.
+- Displays the restaurant's geographic location.
+- Helps users examine an individual restaurant without searching the entire queue.
+
+### 5. Violation Analytics
+- Explores historical violation patterns.
+- Helps users understand how inspection violations relate to restaurant risk.
+- Supports analysis of inspection-related trends when the required data is available.
+
+### 6. Community Area Risk Analysis
+- Aggregates restaurant risk by geographic area.
+- Displays average predicted failure risk by neighborhood.
+- Provides controls for minimum restaurant counts and the number of areas displayed.
+- Shows inspection records, high-risk restaurants, restaurant counts, historical failure rates, and mean predicted failure probabilities.
+- Supports exporting neighborhood summaries to CSV.
+
+### 7. Model Evaluation
+- Compares candidate machine learning models and baseline strategies.
+- Reports ranking and probability-quality metrics.
+- Supports evaluation of the selected model using held-out test data.
+
+### 8. SHAP Explainability
+- Uses SHAP feature importance to explain which features influence model predictions.
+- Helps identify influential factors such as previous failures, violation counts, and time since the previous inspection.
+- Supports model interpretation rather than treating predictions as unexplained outputs.
 
 ---
 
-## 🛡️ Leakage-Free Design Principles
+## 🧠 Machine Learning Approach
 
-To prevent data leakage (a common issue in food safety ML research):
-* **No Future Features**: Features are computed strictly point-in-time *prior* to the next inspection.
-* **Target Isolation**: Target is defined as failure at the *next Canvass inspection* within 1 to 548 days.
-* **Strict Temporal Splitting**:
-  * **Train Set**: Inspection targets prior to Jan 1, 2021.
-  * **Validation Set**: Targets between Jan 1, 2021, and Aug 4, 2022.
-  * **Test Set**: Targets post-Aug 4, 2022.
+The project predicts whether a restaurant will fail its next eligible routine inspection.
+
+### Target Variable
+
+`Target_Next_Routine_Failure`
+
+The target represents the failure outcome at the next eligible routine inspection, according to the project's target-generation logic.
+
+### Feature Engineering
+
+The model uses historical inspection information and engineered features. Examples include:
+
+- `Days_Since_Previous_Inspection`
+- `Previous_Failure_Count`
+- `Hazard_Count`
+- `Previous_Violation_Count`
+- `Historical_Failure_Rate`
+- `Inspection_Year`
+- `Administrative_Count`
+- `Violation_Count`
+- Inspection-type and temporal features
+
+The exact feature set depends on the trained model artifact.
+
+### Model Training
+
+The project benchmark compares the following approaches:
+
+- Calibrated Random Forest
+- Calibrated Logistic Regression
+- Calibrated XGBoost
+- Last Canvass Result baseline
+- Current Inspection Result baseline
+- Constant Training Prevalence baseline
+
+The supplied benchmark identifies **calibrated XGBoost** as the model with the strongest PR-AUC and ROC-AUC among these candidates.
+
+### Prediction Workflow
+
+1. Historical inspection records are prepared.
+2. Features are engineered from inspection history.
+3. The target variable is generated.
+4. Data is divided into training, validation, and test sets.
+5. Candidate models are trained and evaluated.
+6. The selected model produces failure-probability estimates.
+7. A classification threshold can convert probabilities into predicted Pass/Fail classes.
+8. Predicted risks are used to rank restaurants in the priority queue.
+9. The dashboard displays restaurant-level and neighborhood-level results.
+10. SHAP analysis helps explain feature importance.
+
+**Note:** The classification threshold used for Pass/Fail predictions is distinct from the relative risk tiers used for inspection prioritization.
 
 ---
 
-## 📁 Repository Structure
+## 📊 Model Evaluation
+
+The selected model is evaluated using classification metrics and ranking metrics to measure its ability to predict restaurant inspection failures.
+
+### Evaluation Metrics
+
+| Metric | Value | Interpretation |
+|---|---:|---|
+| Accuracy | 78.3% | Percentage of predictions classified correctly. |
+| Precision | 68.7% | Of the restaurants predicted to fail, 68.7% actually failed. |
+| Recall | 82.6% | Of the restaurants that actually failed, 82.6% were correctly identified. |
+| F1 Score | 0.750 | Harmonic mean of precision and recall, balancing both metrics. |
+| PR-AUC | 0.553 | Measures performance across the precision–recall curve, particularly useful for imbalanced classification. |
+| ROC-AUC | 0.742 | Measures the model's ability to distinguish between failure and non-failure cases across classification thresholds. |
+
+**Selected classification threshold:** `0.30`
+
+### Interpretation
+
+- **Accuracy (78.3%):** The model correctly classifies approximately 78 out of every 100 evaluated cases.
+- **Precision (68.7%):** Approximately 69 out of every 100 restaurants predicted to fail are actual failures.
+- **Recall (82.6%):** The model identifies approximately 83 out of every 100 actual failures.
+- **F1 Score (0.750):** Provides a combined measure of precision and recall.
+- **PR-AUC (0.553):** Summarizes precision and recall across different thresholds. Its interpretation depends on the prevalence of failures in the evaluation dataset.
+- **ROC-AUC (0.742):** Indicates useful discrimination between restaurants that fail and those that do not, although performance is not perfect.
+
+### Why Recall Matters
+
+In restaurant inspection risk prediction, missing a restaurant that is likely to fail can be costly. A relatively high recall helps identify more potential failures for further inspection.
+
+However, precision also matters because a low precision score means some restaurants prioritized by the model may not fail their next inspection.
+
+The classification threshold controls the trade-off between precision and recall. Lowering the threshold generally identifies more potential failures but may also increase false positives.
+
+### Important Distinction
+
+The classification metrics above evaluate predicted classes at the selected threshold. PR-AUC and ROC-AUC evaluate model discrimination across a range of thresholds.
+
+The classification threshold of `0.30` is separate from the dashboard's relative risk tiers, which rank restaurants by predicted failure probability.
+
+These metrics should be reported as final test results only if they have been verified against the actual held-out test labels and predictions.
+
+---
+
+## 🔍 Model Explainability with SHAP
+
+SHAP (SHapley Additive exPlanations) helps explain how input features contribute to model predictions.
+
+The feature-importance analysis can highlight factors such as:
+
+- Time since the previous inspection.
+- Previous failure count.
+- Hazard count.
+- Previous violation count.
+- Historical failure rate.
+- Inspection-related features.
+
+### Why SHAP Is Useful
+
+- Improves transparency.
+- Helps users understand which features influence predictions.
+- Supports model debugging and analysis.
+- Provides additional context for interpreting restaurant risk.
+
+SHAP importance does not establish that a feature causes an inspection failure. It describes how the feature contributes to the model's predictions.
+
+---
+
+## 🗺️ Neighborhood Risk Analysis
+
+The neighborhood analysis groups restaurants by geographic location and calculates aggregate risk measures.
+
+Depending on the available input data, the analysis includes:
+
+- Number of inspection records.
+- Number of high-risk restaurants.
+- Number of restaurants represented.
+- Historical failure rate.
+- Mean predicted failure probability.
+
+The dashboard allows users to adjust the minimum number of restaurants represented in an area and the number of areas displayed.
+
+This helps users compare geographic risk patterns while reducing the chance of overinterpreting areas with very few observations.
+
+---
+
+## 🛠️ Technology Stack
+
+| Component | Technology |
+|---|---|
+| Programming Language | Python |
+| Data Processing | Pandas, NumPy |
+| Machine Learning | Scikit-learn, XGBoost |
+| Probability Calibration | Scikit-learn calibration utilities |
+| Model Persistence | Joblib |
+| Model Explainability | SHAP |
+| Dashboard | Streamlit |
+| Interactive Charts | Plotly |
+| Geographic Visualization | PyDeck |
+| Data Formats | CSV, JSON, Joblib |
+
+The dashboard version described here uses PyDeck for geographic visualization. Folium is not listed as a required dependency for that implementation.
+
+---
+
+## 📁 Project Structure
+
+The following is a representative structure. Confirm filenames against the actual repository before running individual scripts.
 
 ```text
 food-safety-risk-predictor/
-├── outputs/                                # Generated model joblib files, metrics, and queue CSVs
-├── app.py                                  # Streamlit MVP Dashboard application
-├── target.py                               # Prepares target labels and point-in-time features
-├── split_data.py                           # Creates temporal train/validation/test datasets
-├── model_building.py                       # Trains, calibrates (Sigmoid), evaluates models & generates queue
-├── explain_model.py                        # Computes SHAP feature importance & waterfall visualizations
-├── audit_test_predictions.py              # Audits deduplicated test set predictions
-├── community_area_analysis.py              # Aggregates neighborhood-level community risk metrics
-├── make_seasonal_csv.py                    # Generates monthly seasonal trend aggregations
-├── requirements.txt                        # Python dependency manifest
-└── README.md                               # Project documentation
-
-```
----
-
-## 💻 Installation & Setup Guide
-
-Follow these step-by-step instructions to set up the environment, run the ML pipeline, and launch the dashboard locally.
-
----
-
-### 1. Prerequisites
-
-Make sure you have the following installed on your machine:
-* **Python**: Version 3.9, 3.10, or 3.11
-* **Git**: Installed and configured
-* **Terminal**: Windows PowerShell (or Command Prompt / Bash)
-
----
-
-### 2. Clone the Repository
-
-Open PowerShell and clone the project:
-
-```powershell
-git clone https://github.com/YOUR-USERNAME/food-safety-risk-predictor.git
-cd food-safety-risk-predictor
-```
-
----
-
-### 3. Create & Activate a Virtual Environment
-Creating a virtual environment ensures all library dependencies remain isolated and compatible.
-
-On Windows (PowerShell):
-
-```PowerShell
-
-python -m venv venv
-.\venv\Scripts\Activate
-(If you encounter an execution policy error on PowerShell, run Set-ExecutionPolicy Unrestricted -Scope Process first, then activate).
-```
-On macOS / Linux:
-
-```Bash
-
-python3 -m venv venv
-source venv/bin/activate
-```
-
----
-
-### 4. Install Dependencies
-Install all required Python packages:
-
-```PowerShell
-
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
----
-
-# 🚀 Pipeline Execution Order
-To reproduce the model evaluation, SHAP plots, and dashboard data files from scratch, run the scripts in the following order:
-
-## Step 1: Feature Engineering & Target Preparation
-Builds point-in-time features and historical compliance indicators without data leakage.
-
-```PowerShell
-
-python target.py
-```
----
-
-## Step 2: Temporal Data Splitting
-Creates chronological train, validation, and held-out test datasets based on inspection dates.
-
-```PowerShell
-
-python split_data.py
-```
----
-
-## Step 3: Model Training, Calibration & Queue Scoring
-Trains Logistic Regression, Random Forest, and XGBoost models; applies Sigmoid Probability Calibration; evaluates against baselines; and exports the prioritized inspector queue.
-
-```PowerShell
-
-python model_building.py
-```
----
-
-## Step 4: Model Explainability (SHAP Plots)
-Calculates global feature importance rankings and generates individual waterfall explanation plots.
-
-```PowerShell
-
-python explain_model.py
-```
----
-
-## Step 5: Neighborhood & Seasonal Aggregations
-Generates community area risk summaries and monthly seasonal failure trends required by the dashboard.
-
-```PowerShell
-
-python community_area_analysis.py
-python make_seasonal_csv.py
-```
----
-
-## Step 6: Launch the Streamlit Dashboard
-Start the web dashboard application:
-
-```PowerShell
-
-python -m streamlit run app.py
-```
-
----
-
-
-# 🌐 Navigating the Application
-Once launched, Streamlit will open automatically in your default browser at:
-http://localhost:8501
-
-Theme Toggling: Use the top-right Streamlit menu (⋮ -> Settings -> Theme) to switch seamlessly between Light and Dark modes.
-Filter Panel: Use the left sidebar to filter facilities by priority tier (Red/Yellow/Green), risk probability thresholds, or Restaurant ID.
-Exporting Data: Operational queues, facility reports, and community area summaries can be exported directly as CSV files using the embedded download buttons.
-
----
-
-
-# 🔬 Tech Stack
-
-- Language: Python 3.10+
-- Data Processing: Pandas, NumPy
-- Machine Learning: Scikit-Learn, XGBoost, Joblib
-- Model Calibration: CalibratedClassifierCV (Sigmoid / Platt Scaling)
-- Model Interpretability: SHAP (SHapley Additive exPlanations)
-- Visualization & Mapping: Streamlit, Plotly Express/Graph Objects, PyDeck (3D Hexagon Layer) 
-
-
-
+│
+├── app.py
+│
+├── target.py
+├── split_data.py
+├── model_building.py
+├── explain_model.py
+├── audit_test_predictions.py
+├── community_area_analysis.py
+├── make_seasonal_csv.py
+│
+├── requirements.txt
+├── README.md
+│
+└── outputs/
+    ├── restaurant_risk_priority_queue_corrected.csv
+    ├── restaurant_scoring_latest.csv
+    ├── restaurant_failure_model.joblib
+    ├── restaurant_failure_base_estimator.joblib
+    ├── restaurant_failure_model_metadata.joblib
+    ├── shap_feature_importance.csv
+    └── model evaluation and neighborhood summary files
