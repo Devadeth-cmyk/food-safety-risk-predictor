@@ -1,0 +1,14 @@
+{
+  "selected_threshold": 0.15,
+  "test_accuracy": 0.3040429658361927,
+  "test_precision": 0.24388895033735206,
+  "test_recall": 0.9317557574477076,
+  "test_f1": 0.3865877712031558,
+  "test_pr_auc": 0.3124241869960142,
+  "test_roc_auc": 0.5871307613226856,
+  "true_negatives": 1704,
+  "false_positives": 13672,
+  "false_negatives": 323,
+  "true_positives": 4410,
+  "predicted_failures": 18082
+}
