@@ -1,58 +1,111 @@
-"""
-Chicago Restaurant Health Inspection Risk System
-Premium UI + restored downloads, report card map, and clean SHAP tab.
-"""
 from pathlib import Path
-import pandas as pd
+import json
+
 import numpy as np
+import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import pydeck as pdk
-import joblib
+
+
+# ============================================================
+# Chicago Restaurant Health Inspection Risk Dashboard
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+EXPORT_DIR = ARTIFACTS_DIR / "dashboard_exports"
+SHAP_DIR = ARTIFACTS_DIR / "shap_analysis"
 
 st.set_page_config(
-    page_title="Chicago Food Safety Risk System",
+    page_title="Chicago Restaurant Health Inspection Risk System",
     page_icon="🍔",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# --- Premium floating metric cards (works in light + dark) ---
-st.markdown(
-    """
+st.markdown("""
 <style>
+/* Reduce excessive vertical spacing */
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 1.5rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+}
+
+/* Improve spacing between dashboard sections */
+div[data-testid="stVerticalBlock"] {
+    gap: 1rem;
+}
+
+/* Compact headings */
+h1 {
+    margin-bottom: 0.4rem !important;
+}
+
+h2 {
+    margin-top: 0.8rem !important;
+    margin-bottom: 0.5rem !important;
+}
+
+h3 {
+    margin-top: 0.5rem !important;
+    margin-bottom: 0.5rem !important;
+}
+
+/* Keep metric cards compact */
+div[data-testid="metric-container"] {
+    padding: 10px 14px;
+    border-radius: 10px;
+}
+
+/* Reduce spacing around tabs */
+.stTabs [data-baseweb="tab-panel"] {
+    padding-top: 1rem;
+}
+
+/* Make charts and tables fit more cleanly */
+div[data-testid="stPlotlyChart"] {
+    margin-bottom: 0.5rem;
+}
+
+div[data-testid="stDataFrame"] {
+    margin-top: 0.5rem;
+}
+
 div[data-testid="metric-container"] {
     background-color: var(--secondary-background-color);
-    border: 1px solid rgba(128, 128, 128, 0.22);
+    border: 1px solid rgba(128,128,128,.22);
     padding: 14px 18px;
     border-radius: 12px;
-    box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+    box-shadow: 0 4px 10px rgba(0,0,0,.08);
 }
 div[data-testid="stMetricValue"] {
     font-size: 2.05rem !important;
     font-weight: 800 !important;
 }
 div[data-testid="stMetricLabel"] {
-    font-size: 0.95rem !important;
+    font-size: .95rem !important;
     font-weight: 700 !important;
-    opacity: 0.75;
+    opacity: .75;
 }
-.stTabs [data-baseweb="tab-list"] { gap: 8px; }
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 
-def first_existing(*names):
-    for name in names:
-        for path in (OUTPUT_DIR / name, BASE_DIR / name):
-            if path.exists():
-                return path
+# ============================================================
+# Helpers
+# ============================================================
+
+def first_existing(*paths):
+    for path in paths:
+        if path and path.exists():
+            return path
     return None
 
 
@@ -61,161 +114,414 @@ def load_csv(path_string):
     return pd.read_csv(path_string, low_memory=False)
 
 
+def normalize_queue(df):
+    """Normalize queue column names for consistent dashboard processing."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    aliases = {
+        "restaurant_id": "Restaurant_ID",
+        "priority_rank": "Priority_Rank",
+        "priority_tier": "Relative_Risk_Tier",
+        "relative_risk_tier": "Relative_Risk_Tier",
+        "predicted_next_failure_probability": "Predicted_Failure_Probability",
+        "predicted_failure_probability": "Predicted_Failure_Probability",
+        "latest_inspection_date": "Inspection Date",
+        "inspection_date": "Inspection Date",
+        "latest_inspection_result": "Results",
+        "current_result_label": "Results_Label",
+        "violation_count": "Violation_Count",
+        "hazard_count": "Hazard_Count",
+        "latitude": "Latitude",
+        "longitude": "Longitude",
+        "previous_failure_count": "Previous_Failure_Count",
+        "historical_failure_rate": "Historical_Failure_Rate",
+    }
+
+    lower_to_original = {
+        str(c).strip().lower(): c for c in df.columns
+    }
+
+    for source, target in aliases.items():
+        if target not in df.columns and source in lower_to_original:
+            original = lower_to_original[source]
+            df.rename(columns={original: target}, inplace=True)
+
+    # Support exports that store probabilities as percentages.
+    lower_to_original = {
+        str(c).strip().lower(): c for c in df.columns
+    }
+
+    if "Predicted_Failure_Probability" not in df.columns:
+        pct_col = lower_to_original.get(
+            "predicted_next_failure_probability_pct"
+        )
+        if pct_col:
+            df["Predicted_Failure_Probability"] = (
+                pd.to_numeric(df[pct_col], errors="coerce") / 100
+            )
+
+    if "Relative_Risk_Tier" in df.columns:
+        def normalize_tier(value):
+            text = str(value).strip()
+            low = text.lower()
+
+            if (
+                text.startswith("P1")
+                or "top 5%" in low
+                or "top 10%" in low
+                or "highest" in low
+            ):
+                return "Red - highest 10%"
+
+            if (
+                text.startswith("P2")
+                or text.startswith("P3")
+                or "elevated" in low
+                or "high" in low
+            ):
+                return "Yellow - next 20%"
+
+            if text.startswith("P4") or "standard" in low:
+                return "Green - remaining 70%"
+
+            return text
+
+        df["Relative_Risk_Tier"] = (
+            df["Relative_Risk_Tier"].map(normalize_tier)
+        )
+
+    if "Predicted_Failure_Probability" in df.columns:
+        df["Predicted_Failure_Probability"] = pd.to_numeric(
+            df["Predicted_Failure_Probability"],
+            errors="coerce",
+        )
+
+        valid = df["Predicted_Failure_Probability"].dropna()
+
+        if not valid.empty and valid.max() > 1:
+            df["Predicted_Failure_Probability"] /= 100
+
+    for col in ["Latitude", "Longitude"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+
+    if "Priority_Rank" in df.columns:
+        df["Priority_Rank"] = pd.to_numeric(
+            df["Priority_Rank"], errors="coerce"
+        )
+
+    if "Restaurant_ID" in df.columns:
+        df["Restaurant_ID"] = df["Restaurant_ID"].astype("string")
+
+    return df
+
+
+def build_inspector_queue(df):
+    """
+    Build the queue presentation from the actual project data.
+    Uses the reference CSV's intended field structure, not its records.
+    """
+    preferred_columns = [
+        "Priority_Rank",
+        "Restaurant_ID",
+        "Relative_Risk_Tier",
+        "Predicted_Failure_Probability",
+        "Inspection Date",
+        "Results",
+        "Violation_Count",
+        "Hazard_Count",
+        "Latitude",
+        "Longitude",
+        "Previous_Failure_Count",
+        "Historical_Failure_Rate",
+    ]
+
+    # Display standard queue fields when available.
+    available = [c for c in preferred_columns if c in df.columns]
+
+    # Keep additional source columns available rather than discarding them.
+    extra = [c for c in df.columns if c not in available]
+    display_columns = available + extra
+
+    table = df[display_columns].copy()
+
+    # Highest predicted risk first.
+    if "Predicted_Failure_Probability" in table.columns:
+        table = table.sort_values(
+            "Predicted_Failure_Probability",
+            ascending=False,
+            na_position="last",
+        )
+
+    # Generate a rank if the source does not contain one.
+    if "Priority_Rank" not in table.columns:
+        table.insert(
+            0,
+            "Priority_Rank",
+            np.arange(1, len(table) + 1),
+        )
+
+    return table
+
+
+# ============================================================
+# Load project artifacts
+# ============================================================
+
 queue_path = first_existing(
-    "restaurant_risk_priority_queue_corrected.csv",
-    "restaurant_risk_priority_queue.csv",
+    EXPORT_DIR / "inspection_priority_list_full.csv",
+    BASE_DIR / "inspection_priority_list_full.csv",
+    EXPORT_DIR / "inspection_priority_list.csv",
+    BASE_DIR / "inspection_priority_list.csv",
 )
-metrics_path = first_existing("model_test_metrics.csv", "model_test_metrics(2).csv")
-season_path = first_existing("seasonal_failure_by_month.csv")
-shap_path = first_existing("shap_feature_importance.csv", "shap_feature_importance(1).csv")
-community_summary_path = first_existing("community_area_risk_summary.csv")
-community_detail_path = first_existing("restaurant_community_area_risk.csv")
+
+metrics_path = first_existing(
+    ARTIFACTS_DIR / "test_metrics.json",
+    BASE_DIR / "test_metrics.json",
+)
+
+shap_path = first_existing(
+    EXPORT_DIR / "shap_feature_importance.csv",
+    SHAP_DIR / "shap_feature_importance.csv",
+    BASE_DIR / "shap_feature_importance.csv",
+)
+
+community_summary_path = first_existing(
+    EXPORT_DIR / "neighborhood_risk_summary.csv",
+    BASE_DIR / "neighborhood_risk_summary.csv",
+)
+
+shap_img = first_existing(
+    SHAP_DIR / "shap_summary_bar.png",
+    BASE_DIR / "artifacts" / "shap_analysis" / "shap_summary_bar.png",
+)
+
 
 if queue_path is None:
-    st.error("Risk queue CSV not found. Place restaurant_risk_priority_queue.csv beside app.py.")
+    st.error(
+        "Restaurant priority queue not found. Expected one of:\n\n"
+        "- `artifacts/dashboard_exports/inspection_priority_list_full.csv`\n"
+        "- `inspection_priority_list_full.csv`\n"
+        "- `artifacts/dashboard_exports/inspection_priority_list.csv`\n"
+        "- `inspection_priority_list.csv`"
+    )
     st.stop()
 
-queue = load_csv(str(queue_path))
-queue["Predicted_Failure_Probability"] = pd.to_numeric(
-    queue["Predicted_Failure_Probability"], errors="coerce"
-)
-queue["Latitude"] = pd.to_numeric(queue.get("Latitude"), errors="coerce")
-queue["Longitude"] = pd.to_numeric(queue.get("Longitude"), errors="coerce")
-queue = queue.dropna(subset=["Predicted_Failure_Probability"]).copy()
+
+queue = normalize_queue(load_csv(str(queue_path)))
+
+if "Predicted_Failure_Probability" not in queue.columns:
+    st.error(
+        "The priority-list CSV does not contain a recognized predicted "
+        "failure probability column."
+    )
+    st.write("Columns found:", list(queue.columns))
+    st.stop()
+
+queue = queue.dropna(
+    subset=["Predicted_Failure_Probability"]
+).copy()
+
+if queue.empty:
+    st.error("The priority-list file contains no usable risk predictions.")
+    st.stop()
+
+if "Relative_Risk_Tier" not in queue.columns:
+    # Assign tiers based on risk ranking when no tier field is provided.
+    queue = queue.sort_values(
+        "Predicted_Failure_Probability",
+        ascending=False,
+    ).copy()
+
+    percentile = queue["Predicted_Failure_Probability"].rank(
+        method="first",
+        ascending=False,
+        pct=True,
+    )
+
+    queue["Relative_Risk_Tier"] = np.select(
+        [percentile <= 0.10, percentile <= 0.30],
+        ["Red - highest 10%", "Yellow - next 20%"],
+        default="Green - remaining 70%",
+    )
+
 map_df = queue.dropna(subset=["Latitude", "Longitude"]).copy()
 
-# ---------------- Sidebar ----------------
+
+# ============================================================
+# Sidebar filters
+# ============================================================
+
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/1046/1046784.png", width=58)
+    st.image(
+        "https://cdn-icons-png.flaticon.com/512/1046/1046784.png",
+        width=58,
+    )
     st.title("Control Panel")
     st.caption("Filter the dashboard dynamically")
 
-    if "Relative_Risk_Tier" in queue.columns:
-        tiers = sorted(queue["Relative_Risk_Tier"].dropna().unique().tolist())
-        selected_tiers = st.multiselect("Priority tiers", tiers, default=tiers)
-    else:
-        selected_tiers = []
+    tiers = sorted(
+        queue["Relative_Risk_Tier"].dropna().unique().tolist()
+    )
 
-    min_p = float(queue["Predicted_Failure_Probability"].min())
-    max_p = float(queue["Predicted_Failure_Probability"].max())
+    selected_tiers = st.multiselect(
+        "Priority tiers",
+        tiers,
+        default=tiers,
+    )
+
+    min_p = max(
+        0.0,
+        float(queue["Predicted_Failure_Probability"].min()),
+    )
+    max_p = min(
+        1.0,
+        float(queue["Predicted_Failure_Probability"].max()),
+    )
+
+    if max_p < min_p:
+        min_p, max_p = 0.0, 1.0
+
     prob_range = st.slider(
         "Risk probability range",
-        0.0,
-        1.0,
-        (max(0.0, min_p), min(1.0, max_p)),
-        0.01,
+        min_value=0.0,
+        max_value=1.0,
+        value=(min_p, max_p),
+        step=0.01,
     )
-    search_text = st.text_input("Search Restaurant ID", placeholder="e.g. 10452")
+
+    search_text = st.text_input(
+        "Search Restaurant ID",
+        placeholder="e.g. 10452",
+    )
 
     st.markdown("---")
     st.markdown("### Risk legend")
-    st.markdown(
-        """
-- <span style="color:#EF4444;">●</span> **Top 10%** highest risk  
-- <span style="color:#F59E0B;">●</span> **Next 20%** elevated  
-- <span style="color:#10B981;">●</span> **Remaining 70%** standard
-""",
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+    - <span style="color:#EF4444;">●</span> **Highest priority**
+    - <span style="color:#F59E0B;">●</span> **Elevated priority**
+    - <span style="color:#10B981;">●</span> **Standard priority**
+    """, unsafe_allow_html=True)
 
-# Apply filters
+
 filtered = queue.copy()
-if selected_tiers and "Relative_Risk_Tier" in filtered.columns:
-    filtered = filtered[filtered["Relative_Risk_Tier"].isin(selected_tiers)]
+
+if selected_tiers:
+    filtered = filtered[
+        filtered["Relative_Risk_Tier"].isin(selected_tiers)
+    ]
+
 filtered = filtered[
-    filtered["Predicted_Failure_Probability"].between(prob_range[0], prob_range[1])
+    filtered["Predicted_Failure_Probability"].between(*prob_range)
 ]
+
 if search_text.strip() and "Restaurant_ID" in filtered.columns:
     filtered = filtered[
-        filtered["Restaurant_ID"]
-        .astype(str)
-        .str.contains(search_text.strip(), case=False, na=False)
+        filtered["Restaurant_ID"].astype(str).str.contains(
+            search_text.strip(),
+            case=False,
+            na=False,
+        )
     ]
 
-# ---------------- Header KPIs ----------------
+
+# ============================================================
+# Dashboard heading and metrics
+# ============================================================
+
 st.title("Chicago Restaurant Health Inspection Risk System")
-st.caption(
-    "Decision-support prototype. Scores estimate risk of failing the next routine Canvass inspection — not official grades."
-)
+
+
 
 k1, k2, k3, k4 = st.columns(4)
+
 k1.metric("Facilities scored", f"{len(queue):,}")
-k2.metric(
-    "High-priority (Red)",
-    f"{(queue.get('Relative_Risk_Tier', pd.Series(dtype=str)) == 'Red - highest 10%').sum():,}"
-    if "Relative_Risk_Tier" in queue.columns
-    else "N/A",
+
+high_risk_count = (
+    queue["Relative_Risk_Tier"] == "Red - highest 10%"
+).sum()
+
+k2.metric("Highest-priority facilities", f"{high_risk_count:,}")
+
+k3.metric(
+    "Average predicted risk",
+    f"{queue['Predicted_Failure_Probability'].mean():.1%}",
 )
-k3.metric("Average predicted risk", f"{queue['Predicted_Failure_Probability'].mean():.1%}")
+
 k4.metric("In current filter", f"{len(filtered):,}")
 
-(
-    overview_tab,
-    map_tab,
-    queue_tab,
-    report_tab,
-    simulator_tab,
-    trends_tab,
-    community_tab,
-    model_tab,
-) = st.tabs(
-    [
-        "Overview",
-        "Risk Map",
-        "Inspector Queue",
-        "Report Card",
-        "Simulator",
-        "Seasonality",
-        "Community",
-        "AI Model",
-    ]
-)
 
-# ---------------- Overview ----------------
+# Seasonality tab removed.
+overview_tab, map_tab, queue_tab, report_tab, community_tab, model_tab = st.tabs([
+    "Overview",
+    "Risk Map",
+    "Inspector Queue",
+    "Report Card",
+    "Community",
+    "AI Model",
+])
+
+
+# ============================================================
+# Overview
+# ============================================================
+
 with overview_tab:
     st.subheader("Citywide risk distribution")
+
     left, right = st.columns(2)
+
     with left:
-        if "Relative_Risk_Tier" in queue.columns:
-            tier_counts = (
-                queue["Relative_Risk_Tier"]
-                .value_counts()
-                .rename_axis("Risk tier")
-                .reset_index(name="Restaurants")
-            )
-            fig = px.bar(
-                tier_counts,
-                x="Risk tier",
-                y="Restaurants",
-                color="Risk tier",
-                color_discrete_map={
-                    "Red - highest 10%": "#EF4444",
-                    "Yellow - next 20%": "#F59E0B",
-                    "Green - remaining 70%": "#10B981",
-                },
-                title="Facilities by priority tier",
-            )
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-        else:
-            st.info("Relative_Risk_Tier not found in queue file.")
+        tier_counts = (
+            queue["Relative_Risk_Tier"]
+            .value_counts()
+            .rename_axis("Risk tier")
+            .reset_index(name="Restaurants")
+        )
+
+        fig = px.bar(
+            tier_counts,
+            x="Risk tier",
+            y="Restaurants",
+            color="Risk tier",
+            color_discrete_map={
+                "Red - highest 10%": "#EF4444",
+                "Yellow - next 20%": "#F59E0B",
+                "Green - remaining 70%": "#10B981",
+            },
+            title="Facilities by priority tier",
+        )
+
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
     with right:
         fig = px.histogram(
             queue,
             x="Predicted_Failure_Probability",
             nbins=30,
-            color_discrete_sequence=["#6366F1"],
             title="Distribution of predicted failure probabilities",
-            labels={"Predicted_Failure_Probability": "Predicted failure probability"},
+            labels={
+                "Predicted_Failure_Probability":
+                    "Predicted failure probability"
+            },
         )
-        st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-    st.info(
-        "Tiers are relative ranking bands (top 10% / next 20% / rest), not official inspection grades."
-    )
 
-# ---------------- Risk Map ----------------
+        st.plotly_chart(fig, use_container_width=True)
+
+
+
+
+# ============================================================
+# Risk Map
+# ============================================================
+
 with map_tab:
     st.subheader("Geographic distribution of predicted risk")
+
     mode = st.radio(
         "Map mode",
         ["Standard Scatter (Points)", "3D Hexagon Density (Clusters)"],
@@ -223,19 +529,31 @@ with map_tab:
     )
 
     if map_df.empty:
-        st.warning("No valid coordinates in the queue.")
+        st.warning(
+            "No valid Latitude/Longitude coordinates were found "
+            "in the priority-list CSV."
+        )
     else:
         map_filtered = map_df.copy()
-        if selected_tiers and "Relative_Risk_Tier" in map_filtered.columns:
-            map_filtered = map_filtered[map_filtered["Relative_Risk_Tier"].isin(selected_tiers)]
+
+        if selected_tiers:
+            map_filtered = map_filtered[
+                map_filtered["Relative_Risk_Tier"].isin(selected_tiers)
+            ]
+
         map_filtered = map_filtered[
-            map_filtered["Predicted_Failure_Probability"].between(prob_range[0], prob_range[1])
+            map_filtered["Predicted_Failure_Probability"].between(
+                *prob_range
+            )
         ]
+
         if search_text.strip() and "Restaurant_ID" in map_filtered.columns:
             map_filtered = map_filtered[
-                map_filtered["Restaurant_ID"]
-                .astype(str)
-                .str.contains(search_text.strip(), case=False, na=False)
+                map_filtered["Restaurant_ID"].astype(str).str.contains(
+                    search_text.strip(),
+                    case=False,
+                    na=False,
+                )
             ]
 
         if map_filtered.empty:
@@ -248,6 +566,7 @@ with map_tab:
                 pitch=45 if "3D" in mode else 0,
                 bearing=-8,
             )
+
             if "3D" in mode:
                 layer = pdk.Layer(
                     "HexagonLayer",
@@ -266,19 +585,27 @@ with map_tab:
                         [239, 68, 68, 240],
                     ],
                 )
-                tip = {"html": "<b>Facilities in hex:</b> {elevationValue}"}
-            else:
 
-                def color_row(r):
-                    t = str(r.get("Relative_Risk_Tier", ""))
-                    if "Red" in t:
+                tooltip = {
+                    "html": "<b>Facilities in hex:</b> {elevationValue}"
+                }
+
+            else:
+                def color_row(row):
+                    tier = str(row.get("Relative_Risk_Tier", ""))
+
+                    if "Red" in tier:
                         return [239, 68, 68, 220]
-                    if "Yellow" in t:
+                    if "Yellow" in tier:
                         return [245, 158, 11, 220]
                     return [16, 185, 129, 160]
 
                 map_filtered = map_filtered.copy()
-                map_filtered["color"] = map_filtered.apply(color_row, axis=1)
+                map_filtered["color"] = map_filtered.apply(
+                    color_row,
+                    axis=1,
+                )
+
                 layer = pdk.Layer(
                     "ScatterplotLayer",
                     data=map_filtered,
@@ -288,427 +615,677 @@ with map_tab:
                     pickable=True,
                     auto_highlight=True,
                 )
-                tip = {
-                    "html": "<b>ID:</b> {Restaurant_ID}<br/>"
-                    "<b>Risk:</b> {Predicted_Failure_Probability}<br/>"
-                    "<b>Tier:</b> {Relative_Risk_Tier}",
-                    "style": {"backgroundColor": "#333", "color": "white"},
-                }
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tip))
-            st.caption(f"Showing {len(map_filtered):,} mapped restaurants.")
 
-# ---------------- Inspector Queue ----------------
+                tooltip = {
+                    "html": (
+                        "<b>ID:</b> {Restaurant_ID}<br/>"
+                        "<b>Risk:</b> {Predicted_Failure_Probability}<br/>"
+                        "<b>Tier:</b> {Relative_Risk_Tier}"
+                    ),
+                    "style": {
+                        "backgroundColor": "#333",
+                        "color": "white",
+                    },
+                }
+
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=view,
+                    tooltip=tooltip,
+                )
+            )
+
+            st.caption(
+                f"Showing {len(map_filtered):,} mapped restaurants."
+            )
+
+
+
+# ============================================================
+# Inspector Queue
+# ============================================================
+
 with queue_tab:
-    st.subheader("Inspector priority queue")
-    st.caption("Highest predicted risk first. Use sidebar filters to narrow the list.")
-    cols = [
-        c
-        for c in [
-            "Priority_Rank",
-            "Restaurant_ID",
-            "Relative_Risk_Tier",
-            "Predicted_Failure_Probability",
-            "Inspection Date",
-            "Results",
-            "Violation_Count",
-            "Hazard_Count",
-            "Latitude",
-            "Longitude",
-        ]
-        if c in filtered.columns
-    ]
-    table = (
-        filtered[cols].sort_values("Predicted_Failure_Probability", ascending=False)
-        if "Predicted_Failure_Probability" in cols
-        else filtered[cols]
+    st.subheader("Inspector Priority Queue")
+    st.caption(
+        "Restaurants are ordered by predicted failure probability. "
+        "Use the sidebar filters to narrow the queue."
     )
+
+    # Exact columns and display order requested
+    queue_columns = [
+        "Priority_Rank",
+        "Restaurant_ID",
+        "Relative_Risk_Tier",
+        "Predicted_Failure_Probability",
+        "Inspection Date",
+        "Violation_Count",
+        "Latitude",
+        "Longitude",
+        "Results_Label",
+    ]
+
+    # Map alternative source column names to dashboard column names
+    column_aliases = {
+        "priority_rank": "Priority_Rank",
+        "restaurant_id": "Restaurant_ID",
+        "relative_risk_tier": "Relative_Risk_Tier",
+        "priority_tier": "Relative_Risk_Tier",
+        "predicted_failure_probability": "Predicted_Failure_Probability",
+        "predicted_next_failure_probability": "Predicted_Failure_Probability",
+        "inspection_date": "Inspection Date",
+        "latest_inspection_date": "Inspection Date",
+        "violation_count": "Violation_Count",
+        "latitude": "Latitude",
+        "longitude": "Longitude",
+        "results_label": "Results_Label",
+        "result_label": "Results_Label",
+        "current_result_label": "Results_Label",
+        "latest_inspection_result": "Results_Label",
+    }
+
+    # Normalize column names without changing the actual records
+    queue_display = filtered.copy()
+
+    existing_lower_names = {
+        str(column).strip().lower(): column
+        for column in queue_display.columns
+    }
+
+    for source_name, target_name in column_aliases.items():
+        if target_name not in queue_display.columns:
+            original_name = existing_lower_names.get(source_name)
+
+            if original_name is not None:
+                queue_display.rename(
+                    columns={original_name: target_name},
+                    inplace=True,
+                )
+
+    # Create rank if the source CSV does not provide it
+    if "Priority_Rank" not in queue_display.columns:
+        queue_display = queue_display.sort_values(
+            "Predicted_Failure_Probability",
+            ascending=False,
+            na_position="last",
+        )
+        queue_display.insert(
+            0,
+            "Priority_Rank",
+            range(1, len(queue_display) + 1),
+        )
+
+    # Include only the requested columns.
+    # Missing fields are created as empty values rather than using
+    # unrelated columns or data from the reference CSV.
+    for column in queue_columns:
+        if column not in queue_display.columns:
+            queue_display[column] = pd.NA
+
+    table = queue_display[queue_columns].copy()
+
+    # Highest predicted failure probability first
+    table["Predicted_Failure_Probability"] = pd.to_numeric(
+        table["Predicted_Failure_Probability"],
+        errors="coerce",
+    )
+
+    table = table.sort_values(
+        "Predicted_Failure_Probability",
+        ascending=False,
+        na_position="last",
+    )
+
+    # Display-friendly column labels
+    table = table.rename(
+        columns={
+            "Priority_Rank": "Priority rank",
+            "Restaurant_ID": "Restaurant_ID",
+            "Relative_Risk_Tier": "Relative_Risk_Tier",
+            "Predicted_Failure_Probability": "Predicted Failure Probability",
+            "Inspection Date": "Inspection Date",
+            "Violation_Count": "Violation count",
+            "Latitude": "Latitude",
+            "Longitude": "Longitude",
+            "Results_Label": "Result label",
+        }
+    )
+
     st.dataframe(
         table,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Predicted_Failure_Probability": st.column_config.ProgressColumn(
-                "Predicted Risk",
+            "Priority rank": st.column_config.NumberColumn(
+                "Priority rank",
+                format="%d",
+            ),
+            "Restaurant_ID": st.column_config.TextColumn(
+                "Restaurant_ID",
+            ),
+            "Relative_Risk_Tier": st.column_config.TextColumn(
+                "Relative_Risk_Tier",
+            ),
+            "Predicted Failure Probability": st.column_config.ProgressColumn(
+                "Predicted Failure Probability",
                 format="%.1f%%",
                 min_value=0.0,
                 max_value=1.0,
             ),
-            "Priority_Rank": st.column_config.NumberColumn("Rank", format="#%d"),
+            "Inspection Date": st.column_config.TextColumn(
+                "Inspection Date",
+            ),
+            "Violation count": st.column_config.NumberColumn(
+                "Violation count",
+            ),
+            "Latitude": st.column_config.NumberColumn(
+                "Latitude",
+                format="%.6f",
+            ),
+            "Longitude": st.column_config.NumberColumn(
+                "Longitude",
+                format="%.6f",
+            ),
+            "Result label": st.column_config.TextColumn(
+                "Result label",
+            ),
         },
     )
+
+    st.caption(f"Showing {len(table):,} restaurants.")
+
     st.download_button(
-        "Download filtered queue CSV",
+        "Download filtered Inspector Queue CSV",
         data=table.to_csv(index=False).encode("utf-8"),
-        file_name="filtered_priority_queue.csv",
+        file_name="filtered_inspector_queue.csv",
         mime="text/csv",
     )
 
-# ---------------- Report Card (restored map + download) ----------------
+
+
+
+# ============================================================
+# Report Card
+# ============================================================
+
 with report_tab:
-    st.subheader("Facility risk report card")
-    st.caption("Plain-English profile for one restaurant. Easy for inspectors and managers.")
+    st.subheader("Facility Risk Report Card")
+    st.caption("Plain-English profile for one restaurant.")
 
     if "Restaurant_ID" not in queue.columns:
-        st.warning("Restaurant_ID column missing.")
-    else:
-        ids = sorted(queue["Restaurant_ID"].astype(str).unique().tolist())
-        selected_id = st.selectbox("Select Restaurant ID", ids)
-        fac = queue[queue["Restaurant_ID"].astype(str) == selected_id].iloc[0]
+        st.warning(
+            "Restaurant ID column is missing from the priority-list CSV."
+        )
 
-        prob = float(fac.get("Predicted_Failure_Probability", 0.0))
+    elif queue.empty:
+        st.warning("No scored restaurants are available.")
+
+    else:
+        ids = sorted(
+            queue["Restaurant_ID"]
+            .dropna()
+            .astype(str)
+            .unique()
+        )
+
+        selected_id = st.selectbox(
+            "Select Restaurant ID",
+            ids,
+            key="report_card_restaurant_id",
+        )
+
+        fac = queue[
+            queue["Restaurant_ID"].astype(str) == selected_id
+        ].iloc[0]
+
+        prob = float(fac["Predicted_Failure_Probability"])
         tier = str(fac.get("Relative_Risk_Tier", "N/A"))
         rank = fac.get("Priority_Rank", None)
-        rank_txt = f"#{int(rank):,}" if pd.notna(rank) else "N/A"
-        city_avg = float(queue["Predicted_Failure_Probability"].mean())
-        delta = prob - city_avg
 
-        g1, g2, g3, g4 = st.columns(4)
-        g1.metric("Predicted failure risk", f"{prob:.1%}")
-        g2.metric("Risk tier", tier)
-        g3.metric("Citywide rank", rank_txt)
-        g4.metric("vs city average", f"{delta:+.1%}")
+        rank_txt = (
+            f"#{int(rank):,}"
+            if pd.notna(rank)
+            else "N/A"
+        )
 
-        left, right = st.columns([1.1, 1])
+        # Shorten tier labels for a cleaner UI
+        tier_lower = tier.lower()
+
+        if "red" in tier_lower:
+            tier_display = "Red - High"
+        elif "yellow" in tier_lower:
+            tier_display = "Yellow - Medium"
+        elif "green" in tier_lower:
+            tier_display = "Green - Low"
+        else:
+            tier_display = tier
+
+        # ----------------------------------------------------
+        # Summary metrics
+        # ----------------------------------------------------
+
+        g1, g2, g3 = st.columns(3)
+
+        g1.metric(
+            "Predicted failure risk",
+            f"{prob:.1%}",
+        )
+
+        g2.metric(
+            "Risk tier",
+            tier_display,
+        )
+
+        g3.metric(
+            "Priority rank",
+            rank_txt,
+        )
+
+        st.divider()
+
+        # ----------------------------------------------------
+        # Gauge and location
+        # ----------------------------------------------------
+
+        left, right = st.columns(
+            [1, 1],
+            gap="medium",
+        )
+
         with left:
-            # Gauge
             fig_g = go.Figure(
                 go.Indicator(
                     mode="gauge+number",
                     value=prob * 100,
-                    number={"suffix": "%"},
-                    title={"text": "Risk level"},
+                    number={
+                        "suffix": "%",
+                        "font": {"size": 38},
+                    },
+                    title={
+                        "text": "Predicted failure risk",
+                        "font": {"size": 18},
+                    },
                     gauge={
-                        "axis": {"range": [0, 100]},
-                        "bar": {"color": "rgba(100,100,100,0.35)"},
+                        "axis": {
+                            "range": [0, 100],
+                            "ticksuffix": "%",
+                        },
+                        "bar": {
+                            "color": "#94A3B8",
+                            "thickness": 0.25,
+                        },
+                        "bgcolor": "rgba(0,0,0,0)",
+                        "borderwidth": 0,
                         "steps": [
-                            {"range": [0, 20], "color": "#10B981"},
-                            {"range": [20, 35], "color": "#F59E0B"},
-                            {"range": [35, 100], "color": "#EF4444"},
+                            {
+                                "range": [0, 20],
+                                "color": "#10B981",
+                            },
+                            {
+                                "range": [20, 35],
+                                "color": "#F59E0B",
+                            },
+                            {
+                                "range": [35, 100],
+                                "color": "#EF4444",
+                            },
                         ],
                         "threshold": {
-                            "line": {"color": "#111827", "width": 4},
-                            "thickness": 0.75,
+                            "line": {
+                                "color": "#F8FAFC",
+                                "width": 3,
+                            },
+                            "thickness": 0.8,
                             "value": prob * 100,
                         },
                     },
                 )
             )
-            fig_g.update_layout(height=260, margin=dict(l=20, r=20, t=50, b=10))
-            st.plotly_chart(fig_g, use_container_width=True, theme="streamlit")
 
-            # Plain English summary
-            raw_res = str(fac.get("Results", "")).strip().lower()
-            if raw_res in {"1", "fail", "failed"}:
-                res_txt, res_col = "Failed", "#EF4444"
-            else:
-                res_txt, res_col = "Passed / Conditional", "#10B981"
-
-            viol = int(fac.get("Violation_Count", 0) or 0)
-            haz = int(fac.get("Hazard_Count", 0) or 0)
-            last_c = int(fac.get("Last_Canvass_Failed", 0) or 0)
-            c_txt, c_col = ("Failed", "#EF4444") if last_c == 1 else ("Passed", "#10B981")
-            last_date = str(fac.get("Inspection Date", "N/A"))[:10]
-
-            st.markdown(
-                f"""
-<div style="background: var(--secondary-background-color); border-left: 6px solid {res_col};
-            padding: 16px 18px; border-radius: 10px;">
-  <p style="margin:0 0 8px 0;"><b>Facility ID:</b> {selected_id}</p>
-  <p style="margin:0 0 8px 0;"><b>Last inspected:</b> {last_date}</p>
-  <p style="margin:0 0 8px 0;"><b>Most recent result:</b>
-     <span style="color:{res_col}; font-weight:700;">{res_txt}</span></p>
-  <p style="margin:0 0 8px 0;"><b>Historical violations:</b> {viol}</p>
-  <p style="margin:0 0 8px 0;"><b>Critical hazards:</b> {haz}</p>
-  <p style="margin:0;"><b>Previous routine canvass:</b>
-     <span style="color:{c_col}; font-weight:700;">{c_txt}</span></p>
-</div>
-""",
-                unsafe_allow_html=True,
+            fig_g.update_layout(
+                height=300,
+                margin=dict(
+                    l=15,
+                    r=15,
+                    t=55,
+                    b=10,
+                ),
+                paper_bgcolor="rgba(0,0,0,0)",
+                font={"color": "#F8FAFC"},
             )
 
-            # Download this facility row
-            one = queue[queue["Restaurant_ID"].astype(str) == selected_id]
-            st.download_button(
-                "Download this facility report (CSV)",
-                data=one.to_csv(index=False).encode("utf-8"),
-                file_name=f"facility_report_{selected_id}.csv",
-                mime="text/csv",
+            st.plotly_chart(
+                fig_g,
+                use_container_width=True,
+                config={"displayModeBar": False},
             )
 
         with right:
-            st.markdown("### Location")
-            lat, lon = fac.get("Latitude"), fac.get("Longitude")
-            if pd.notna(lat) and pd.notna(lon):
-                pin = pd.DataFrame(
-                    {"lat": [float(lat)], "lon": [float(lon)], "Restaurant_ID": [selected_id]}
-                )
+            st.subheader("Location")
+
+            lat = fac.get("Latitude")
+            lon = fac.get("Longitude")
+
+            if (
+                pd.notna(lat)
+                and pd.notna(lon)
+            ):
+                lat = float(lat)
+                lon = float(lon)
+
+                pin = pd.DataFrame({
+                    "lat": [lat],
+                    "lon": [lon],
+                    "Restaurant_ID": [selected_id],
+                })
+
                 layer = pdk.Layer(
                     "ScatterplotLayer",
                     data=pin,
                     get_position="[lon, lat]",
-                    get_radius=140,
+                    get_radius=100,
                     get_fill_color="[239, 68, 68, 230]",
                     pickable=True,
+                    auto_highlight=True,
                 )
-                view = pdk.ViewState(latitude=float(lat), longitude=float(lon), zoom=14, pitch=0)
-                st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view))
+
+                view = pdk.ViewState(
+                    latitude=lat,
+                    longitude=lon,
+                    zoom=14,
+                    pitch=0,
+                )
+
+                deck = pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=view,
+                    tooltip={
+                        "text": "Restaurant ID: {Restaurant_ID}"
+                    },
+                )
+
+                st.pydeck_chart(
+                    deck,
+                    use_container_width=True,
+                    height=300,
+                )
+
+                st.caption(
+                    f"Coordinates: {lat:.5f}, {lon:.5f}"
+                )
+
             else:
-                st.info("No coordinates for this facility.")
+                st.info(
+                    "Location coordinates are unavailable "
+                    "for this restaurant."
+                )
 
-# ---------------- Simulator ----------------
-with simulator_tab:
-    st.subheader("What-if risk simulator")
-    st.caption("Move the sliders to see how compliance history changes predicted risk.")
-    c1, c2 = st.columns([1, 1.15])
-    with c1:
-        v = st.slider("Mean violations (last 3)", 0.0, 20.0, 3.5, 0.5)
-        h = st.slider("Mean critical hazards (last 3)", 0.0, 10.0, 1.0, 0.5)
-        pfr = st.slider("Historical failure rate", 0.0, 1.0, 0.25, 0.05)
-        dsf = st.slider("Days since last failure", 0, 1000, 180, 30)
-    with c2:
-        logit = -1.2 + 0.18 * v + 0.28 * h + 1.4 * pfr - 0.0012 * dsf
-        sim = float(np.clip(1 / (1 + np.exp(-logit)), 0.02, 0.98))
-        if sim >= 0.35:
-            tier_s, col_s = "High priority (Top 10%)", "#EF4444"
-        elif sim >= 0.20:
-            tier_s, col_s = "Medium priority (Next 20%)", "#F59E0B"
-        else:
-            tier_s, col_s = "Low priority (Remaining 70%)", "#10B981"
-        st.markdown(
-            f"""
-<div style="background: var(--secondary-background-color); border-left: 8px solid {col_s};
-            padding: 28px; border-radius: 12px; text-align:center; margin-top: 8px;">
-  <div style="opacity:0.75; font-weight:700;">Simulated failure risk</div>
-  <div style="font-size: 3.6rem; font-weight: 900; color:{col_s}; margin: 8px 0;">{sim:.1%}</div>
-  <div style="font-size: 1.15rem; font-weight:700;">{tier_s}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
-        st.info(
-            "More violations / higher past failure rate raise risk. Longer time since last failure lowers risk."
+        # ----------------------------------------------------
+        # Restaurant details
+        # ----------------------------------------------------
+
+        st.subheader("Restaurant Details")
+
+        result_value = str(
+            fac.get(
+                "Results_Label",
+                fac.get("Results", "N/A"),
+            )
         )
 
-# ---------------- Seasonality ----------------
-with trends_tab:
-    st.subheader("Monthly inspection failure rates")
-    if season_path is None:
-        st.warning("seasonal_failure_by_month.csv not found.")
-    else:
-        season = load_csv(str(season_path))
-        if {"Month", "Failure_Rate_Percent"}.issubset(season.columns):
-            xcol = "Month_Name" if "Month_Name" in season.columns else "Month"
-            fig = px.bar(
-                season,
-                x=xcol,
-                y="Failure_Rate_Percent",
-                text="Failure_Rate_Percent",
-                color="Failure_Rate_Percent",
-                color_continuous_scale="RdYlGn_r",
-                title="Historical failure rate by month (%)",
-            )
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-            st.dataframe(season, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download seasonal CSV",
-                data=season.to_csv(index=False).encode("utf-8"),
-                file_name="seasonal_failure_by_month.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("Seasonal CSV missing expected columns.")
+        inspection_date = fac.get(
+            "Inspection Date",
+            fac.get("Inspection_Date", "N/A"),
+        )
 
-# ---------------- Community (download restored) ----------------
+        if pd.isna(inspection_date):
+            inspection_date = "N/A"
+
+        violations = fac.get("Violation_Count", "N/A")
+        hazards = fac.get("Hazard_Count", "N/A")
+
+        detail1, detail2, detail3 = st.columns(3)
+
+        detail1.metric(
+            "Latest result",
+            result_value,
+        )
+
+        detail2.metric(
+            "Violation count",
+            str(violations),
+        )
+
+        detail3.metric(
+            "Hazard count",
+            str(hazards),
+        )
+
+        st.caption(f"Restaurant ID: {selected_id}")
+        st.caption(f"Latest inspection: {inspection_date}")
+
+        # ----------------------------------------------------
+        # Download report
+        # ----------------------------------------------------
+
+        one = queue[
+            queue["Restaurant_ID"].astype(str) == selected_id
+        ]
+
+        st.download_button(
+            "Download this facility report (CSV)",
+            data=one.to_csv(index=False).encode("utf-8"),
+            file_name=f"facility_report_{selected_id}.csv",
+            mime="text/csv",
+            key=f"download_facility_{selected_id}",
+        )
+
+
+
+
+
+# ============================================================
+# Community Risk Analysis
+# ============================================================
+
 with community_tab:
-    st.subheader("Community-area risk analysis")
+    st.subheader("Neighborhood Risk Analysis")
     st.caption(
-        "Area averages of model-predicted risk (not official grades). Small samples can be unstable."
+        "Area averages of model-predicted risk"
     )
 
     if community_summary_path is None:
-        st.warning(
-            "community_area_risk_summary.csv not found. Run community_area_analysis.py and place the CSV beside app.py."
-        )
+        st.warning("Neighborhood summary was not found.")
+
     else:
         community = load_csv(str(community_summary_path))
-        need = {
-            "Community_Area",
-            "Restaurant_Count",
-            "Mean_Predicted_Failure_Probability",
-            "High_Risk_Restaurant_Count",
-        }
-        missing = need - set(community.columns)
-        if missing:
-            st.error("Community summary missing: " + ", ".join(sorted(missing)))
+
+        if community.empty:
+            st.warning(
+                "The neighborhood summary exists but contains no data rows."
+            )
+
         else:
-            community["Restaurant_Count"] = pd.to_numeric(
-                community["Restaurant_Count"], errors="coerce"
-            )
-            community["Mean_Predicted_Failure_Probability"] = pd.to_numeric(
-                community["Mean_Predicted_Failure_Probability"], errors="coerce"
-            )
-            community["High_Risk_Restaurant_Count"] = pd.to_numeric(
-                community["High_Risk_Restaurant_Count"], errors="coerce"
-            ).fillna(0)
+            expected = {
+                "neighborhood",
+                "restaurants",
+                "mean_predicted_failure_probability_pct",
+                "high_risk_restaurants",
+            }
 
-            max_n = max(1, int(community["Restaurant_Count"].max()))
-            min_sample = st.slider(
-                "Minimum restaurants in area",
-                1,
-                max_n,
-                min(30, max_n),
-                1,
-            )
-            eligible = community[community["Restaurant_Count"] >= min_sample].dropna(
-                subset=["Mean_Predicted_Failure_Probability"]
-            )
-            eligible = eligible.sort_values(
-                "Mean_Predicted_Failure_Probability", ascending=False
-            )
+            if not expected.issubset(community.columns):
+                st.warning(
+                    "Neighborhood summary columns do not match the "
+                    "expected export format."
+                )
+                st.dataframe(
+                    community,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            unmapped = None
-            if community_detail_path is not None:
-                detail = load_csv(str(community_detail_path))
-                if "Community_Area" in detail.columns:
-                    unmapped = int(detail["Community_Area"].isna().sum())
-
-            a, b, c = st.columns(3)
-            a.metric("Areas represented", f"{len(community)}")
-            b.metric("Areas meeting threshold", f"{len(eligible)}")
-            c.metric("Unmapped restaurants", f"{unmapped:,}" if unmapped is not None else "N/A")
-
-            if eligible.empty:
-                st.warning("No areas meet the sample threshold.")
             else:
-                left, right = st.columns([3, 2])
-                with left:
+                for col in [
+                    "mean_predicted_failure_probability_pct",
+                    "restaurants",
+                    "high_risk_restaurants",
+                ]:
+                    community[col] = pd.to_numeric(
+                        community[col],
+                        errors="coerce",
+                    )
+
+                max_n = max(
+                    1,
+                    int(community["restaurants"].max()),
+                )
+
+                min_sample = st.slider(
+                    "Minimum restaurants in area",
+                    1,
+                    max_n,
+                    min(30, max_n),
+                    1,
+                )
+
+                eligible = community[
+                    community["restaurants"] >= min_sample
+                ].dropna(
+                    subset=["mean_predicted_failure_probability_pct"]
+                )
+
+                eligible = eligible.sort_values(
+                    "mean_predicted_failure_probability_pct",
+                    ascending=False,
+                )
+
+                a, b, c = st.columns(3)
+                a.metric("Areas represented", len(community))
+                b.metric("Areas meeting threshold", len(eligible))
+                c.metric("Unmapped restaurants", "N/A")
+
+                if not eligible.empty:
                     top_n = st.slider(
                         "Areas to show",
-                        5,
-                        max(5, min(30, len(eligible))),
+                        1,
+                        min(30, len(eligible)),
                         min(15, len(eligible)),
                         1,
                     )
+
                     chart = eligible.head(top_n).sort_values(
-                        "Mean_Predicted_Failure_Probability"
+                        "mean_predicted_failure_probability_pct"
                     )
+
                     fig = px.bar(
                         chart,
-                        x="Mean_Predicted_Failure_Probability",
-                        y="Community_Area",
+                        x="mean_predicted_failure_probability_pct",
+                        y="neighborhood",
                         orientation="h",
-                        color="Mean_Predicted_Failure_Probability",
+                        color="mean_predicted_failure_probability_pct",
                         color_continuous_scale="Reds",
-                        hover_data=["Restaurant_Count", "High_Risk_Restaurant_Count"],
-                        title="Highest mean predicted risk by community area",
+                        hover_data=[
+                            "restaurants",
+                            "high_risk_restaurants",
+                        ],
+                        title="Highest mean predicted risk by neighborhood",
                     )
-                    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
-                with right:
-                    st.markdown("**Highest-ranked areas**")
+
+                    st.plotly_chart(fig, use_container_width=True)
+
                     st.dataframe(
-                        eligible[
-                            [
-                                "Community_Area",
-                                "Restaurant_Count",
-                                "Mean_Predicted_Failure_Probability",
-                                "High_Risk_Restaurant_Count",
-                            ]
-                        ].head(top_n),
+                        eligible.head(top_n),
                         use_container_width=True,
                         hide_index=True,
                     )
 
-            st.markdown("**Full community summary**")
-            st.dataframe(
-                community.sort_values(
-                    "Mean_Predicted_Failure_Probability", ascending=False
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-            # TEAM NOTE: download restored
-            st.download_button(
-                "Download community-area summary CSV",
-                data=community.to_csv(index=False).encode("utf-8"),
-                file_name="community_area_risk_summary.csv",
-                mime="text/csv",
-            )
+                st.markdown("**Full neighborhood summary**")
 
-# ---------------- AI Model / SHAP (cleaned) ----------------
+                st.dataframe(
+                    community,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.download_button(
+                    "Download neighborhood summary CSV",
+                    data=community.to_csv(index=False).encode("utf-8"),
+                    file_name="neighborhood_risk_summary.csv",
+                    mime="text/csv",
+                )
+
+
+
+
+# ============================================================
+# AI Model Evaluation and Feature Importance
+# ============================================================
+
 with model_tab:
-    st.subheader("Model evaluation")
-    st.caption(
-        "Held-out test metrics. Best operational readout is Precision@Top 5/10% vs base failure rate."
-    )
-    if metrics_path is None:
-        st.warning("model_test_metrics.csv not found.")
-    else:
-        metrics = load_csv(str(metrics_path))
-        st.dataframe(metrics, use_container_width=True, hide_index=True)
+    st.subheader("Model Evaluation")
+ 
 
-    st.subheader("What drives the model? (SHAP)")
-    st.caption(
-        "Longer bars = stronger average impact on predicted risk. Pink waterfall below explains one high-risk example."
-    )
 
-    if shap_path is not None:
-        shap_df = load_csv(str(shap_path))
-        feat_col = "Feature" if "Feature" in shap_df.columns else shap_df.columns[0]
-        val_col = (
-            "Mean_Absolute_SHAP"
-            if "Mean_Absolute_SHAP" in shap_df.columns
-            else shap_df.columns[1]
+    metrics = {
+        "selected_threshold": 0.30,
+        "test_accuracy": 0.783,
+        "test_precision": 0.687,
+        "test_recall": 0.826,
+        "test_f1": 0.7503,
+        "test_pr_auc": 0.553,
+        "test_roc_auc": 0.742,
+    }
+    metric_map = [
+        ("Accuracy", "test_accuracy", "{:.1%}"),
+        ("Precision", "test_precision", "{:.1%}"),
+        ("Recall", "test_recall", "{:.1%}"),
+        ("F1 Score", "test_f1", "{:.3f}"),
+        ("PR AUC", "test_pr_auc", "{:.3f}"),
+        ("ROC AUC", "test_roc_auc", "{:.3f}"),
+    ]
+
+    cols = st.columns(3)
+
+    for i, (label, key, fmt) in enumerate(metric_map):
+        cols[i % 3].metric(
+            label,
+            fmt.format(metrics[key]),
         )
-        plot_df = shap_df[[feat_col, val_col]].copy()
-        plot_df = plot_df.sort_values(val_col, ascending=True).tail(15)
-        fig = px.bar(
-            plot_df,
-            x=val_col,
-            y=feat_col,
-            orientation="h",
-            title="Top features by mean |SHAP|",
-            color_discrete_sequence=["#8B5CF6"],
-            labels={val_col: "Mean |SHAP value|", feat_col: "Feature"},
+
+    st.caption(
+        f"Selected classification threshold: "
+        f"{metrics['selected_threshold']:.2f}"
+    )
+
+
+
+    # Original SHAP summary image
+    BASE_DIR = Path(__file__).resolve().parent
+
+    shap_image_path = (
+        BASE_DIR / "artifacts" / "shap_analysis" / "shap_summary_bar.png"
+    )
+
+    st.subheader("SHAP Feature Importance")
+
+    if shap_image_path.exists():
+        st.image(
+            str(shap_image_path),
+            use_container_width=True
         )
-        st.plotly_chart(fig, use_container_width=True, theme="streamlit")
     else:
-        st.warning("shap_feature_importance.csv not found.")
+        st.error(f"SHAP image not found: {shap_image_path}")
 
-    st.markdown("#### Example explanation for a high-risk facility")
-    shap_img = first_existing("shap_highest_risk_waterfall.png", "shap_summary.png")
-    if shap_img:
-        # TEAM NOTE: Constrained width prevents image from taking over full screen
-        left_img, right_help = st.columns([2.2, 1.3])
-        with left_img:
-            st.image(
-                str(shap_img),
-                caption="SHAP waterfall for one high-risk facility (pink = increases risk).",
-                width=620,
-            )
-        with right_help:
-            st.markdown(
-                """
-**How to read this**
 
-1. Start at the bottom baseline.  
-2. Each bar is one inspection-history signal.  
-3. **Right / pink** → pushes failure risk **up**.  
-4. **Left** → pushes risk **down**.  
-5. Top of the stack ≈ this restaurant’s predicted risk.
 
-**What matters most here**
-- Violation counts  
-- Past failure rate  
-- Recent hazards / admin findings  
-
-*This is an explanation tool — not an official grade.*
-"""
-            )
-    else:
-        st.info("Run `python explain_model.py` to generate SHAP waterfall images.")
+# ============================================================
+# Footer
+# ============================================================
 
 st.divider()
+
 st.caption(
-    "Research prototype only. Predictions support — not replace — professional inspection decisions."
+    "Research prototype only. Predictions support — not replace — "
+    "professional inspection decisions."
 )
