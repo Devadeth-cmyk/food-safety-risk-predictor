@@ -12,3 +12,9 @@ __pycache__/
 # Generated training, scoring, prediction, and audit data
 /outputs/*.csv
 /outputs/*.joblib
+
+# Local encoded datasets and feature-engineered data
+/X_full_encoded.csv
+/y_full.csv
+/restaurant_feature_engineered_encoded_full.csv
+/restaurant_feature_engineered_fixed.csv

@@ -1,380 +1,746 @@
-"""Train, compare, calibrate and score next-routine-inspection failure models.
 
-Validation: choose among unweighted Logistic Regression, Random Forest and XGBoost
-using average rank of PR-AUC (higher is better) and Brier score (lower is better).
-Test: evaluate once using a model fitted before validation and calibrated on validation.
-Deployment: after the test report is written, fit a deployment model on older labelled
-rows and calibrate on a recent temporal holdout; score latest rows for a priority queue.
-"""
 from pathlib import Path
-import time  # Added time module to track model training duration
+import json
 import warnings
+
 import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    ExtraTreesClassifier,
+    HistGradientBoostingClassifier,
+)
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
-try:
-    from sklearn.frozen import FrozenEstimator  # scikit-learn >= 1.6
-except ImportError:
-    FrozenEstimator = None
-from sklearn.metrics import average_precision_score, roc_auc_score, brier_score_loss
-from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    average_precision_score,
+    roc_auc_score,
+    confusion_matrix,
+    classification_report,
+)
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-OUTPUT_DIR.mkdir(exist_ok=True)
-TRAIN_PATH = OUTPUT_DIR / "restaurant_train.csv"
-TEST_PATH = OUTPUT_DIR / "restaurant_test.csv"
-LABELLED_PATH = OUTPUT_DIR / "restaurant_target_prepared.csv"
-SCORING_PATH = OUTPUT_DIR / "restaurant_scoring_latest.csv"
-for _path_name in ("restaurant_train.csv", "restaurant_test.csv", "restaurant_target_prepared.csv", "restaurant_scoring_latest.csv"):
-    if not (OUTPUT_DIR / _path_name).exists() and (BASE_DIR / _path_name).exists():
-        if _path_name == "restaurant_train.csv": TRAIN_PATH = BASE_DIR / _path_name
-        elif _path_name == "restaurant_test.csv": TEST_PATH = BASE_DIR / _path_name
-        elif _path_name == "restaurant_target_prepared.csv": LABELLED_PATH = BASE_DIR / _path_name
-        else: SCORING_PATH = BASE_DIR / _path_name
+warnings.filterwarnings("ignore")
 
-TARGET = "Target_Next_Routine_Failure"
-VALIDATION_START = pd.Timestamp("2021-01-01")
-TEST_START = pd.Timestamp("2022-08-04")
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+X_FILE = Path("X_full_encoded.csv")
+Y_FILE = Path("y_full.csv")
+COMBINED_FILE = Path(
+    "restaurant_feature_engineered_encoded_full.csv"
+)
+
+OUTPUT_DIR = Path("artifacts")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGET = "Target_Next_Results"
+
+TRAIN_FRACTION = 0.70
+VALIDATION_FRACTION = 0.15
+TEST_FRACTION = 0.15
+
 RANDOM_STATE = 42
-MAX_CALIBRATION_DAYS = 548
 
-# These columns are identifiers, future/label fields, raw free text, or features
-# explicitly excluded to reduce leakage/high-cardinality time/geography shortcuts.
-EXCLUDE_COLUMNS = {
-    "Restaurant_ID", "Inspection Date", "Inspection_Sequence",
-    "Next_Result", "Next_Sequence", "Next_Inspection_Date",
-    "Next_Routine_Result", "Next_Routine_Sequence",
-    "Next_Routine_Inspection_Date", "Target_Gap_Days", TARGET,
-    "Violations", "Inspection_Year", "Geo_Grid_ID",
+THRESHOLDS = [
+    0.05, 0.10, 0.15, 0.20, 0.25,
+    0.30, 0.35, 0.40, 0.45, 0.50,
+]
+
+EXCLUDE_FEATURES = {
+    "Restaurant_ID",
+    "source_row_index",
+    "Inspection Date",
+    "Results",
+    "Risk",
+    "Target_Next_Results",
 }
 
 
-def make_X(frame):
-    X = frame.drop(columns=list(EXCLUDE_COLUMNS), errors="ignore").copy()
-    # Defensive removal of future-looking columns by name.
-    X = X.drop(columns=[c for c in X.columns if c.startswith("Next_") or c.startswith("Target_")], errors="ignore")
-    return X
+# ============================================================
+# 2. LOAD AND VALIDATE DATA
+# ============================================================
 
+def load_data():
 
-def make_preprocessor(X):
-    categorical_cols = X.select_dtypes(include=["object", "category", "string", "bool"]).columns.tolist()
-    numeric_cols = [c for c in X.columns if c not in categorical_cols]
-    numeric_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler(with_mean=False)),
-    ])
-    categorical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-    ])
-    return ColumnTransformer([
-        ("numeric", numeric_pipeline, numeric_cols),
-        ("categorical", categorical_pipeline, categorical_cols),
-    ], remainder="drop")
+    for file_path in [X_FILE, Y_FILE, COMBINED_FILE]:
+        if not file_path.exists():
+            raise FileNotFoundError(
+                f"Required file not found: {file_path.resolve()}"
+            )
 
+    X_all = pd.read_csv(X_FILE)
+    y_frame = pd.read_csv(Y_FILE)
+    combined = pd.read_csv(COMBINED_FILE)
 
-def make_pipeline(estimator, X_fit):
-    return Pipeline([
-        ("preprocess", make_preprocessor(X_fit)),
-        ("model", estimator),
-    ])
-
-# TEAM NOTE: Updated to include Top 10% metrics for better inspector capacity planning
-def safe_metrics(y_true, scores):
-    y_true = np.asarray(y_true, dtype=int)
-    scores = np.asarray(scores, dtype=float)
-    
-    def _at_k(frac):
-        k = max(1, int(np.ceil(frac * len(y_true))))
-        top_idx = np.argsort(scores)[::-1][:k]
-        positives = int(y_true.sum())
-        return {
-            "precision": float(y_true[top_idx].mean()),
-            "recall": float(y_true[top_idx].sum() / positives) if positives else np.nan,
-            "count": int(k),
-        }
-        
-    top5 = _at_k(0.05)
-    top10 = _at_k(0.10)
-    roc = roc_auc_score(y_true, scores) if len(np.unique(y_true)) == 2 else np.nan
-    
-    return {
-        "PR_AUC": average_precision_score(y_true, scores),
-        "ROC_AUC": roc,
-        "Brier_Score": brier_score_loss(y_true, np.clip(scores, 0, 1)),
-        "Precision_At_Top_5pct": top5["precision"],
-        "Recall_At_Top_5pct": top5["recall"],
-        "Precision_At_Top_10pct": top10["precision"],
-        "Recall_At_Top_10pct": top10["recall"],
-        "Base_Failure_Rate": float(y_true.mean()),
-        "Top_5pct_Count": top5["count"],
-        "Top_10pct_Count": top10["count"],
-    }
-
-def calibrate_prefit(estimator, X_cal, y_cal):
-    """Fit sigmoid calibration on a held-out chronological calibration period."""
-    if FrozenEstimator is not None:
-        calibrated = CalibratedClassifierCV(
-            estimator=FrozenEstimator(estimator), method="sigmoid"
+    if not (
+        len(X_all) == len(y_frame) == len(combined)
+    ):
+        raise ValueError(
+            "Row counts differ between X, y, and combined CSV files."
         )
-    else:
-        # Compatible with scikit-learn 1.5; cv='prefit' is deprecated in newer releases.
-        try:
-            calibrated = CalibratedClassifierCV(
-                estimator=estimator, method="sigmoid", cv="prefit"
-            )
-        except TypeError:
-            calibrated = CalibratedClassifierCV(
-                base_estimator=estimator, method="sigmoid", cv="prefit"
-            )
-    calibrated.fit(X_cal, y_cal)
-    return calibrated
 
-def read_dates(path):
-    return pd.read_csv(
-        path,
-        parse_dates=["Inspection Date", "Next_Routine_Inspection_Date"],
-        low_memory=False,
+    if TARGET not in y_frame.columns:
+        raise KeyError(f"{TARGET} missing from y_full.csv")
+
+    if TARGET not in combined.columns:
+        raise KeyError(f"{TARGET} missing from combined CSV")
+
+    if "Inspection Date" not in combined.columns:
+        raise KeyError(
+            "Inspection Date missing from combined CSV"
+        )
+
+    if not y_frame[TARGET].reset_index(drop=True).equals(
+        combined[TARGET].reset_index(drop=True)
+    ):
+        raise ValueError("Target alignment verification failed.")
+
+    dates_all = pd.to_datetime(
+        combined["Inspection Date"],
+        errors="coerce",
     )
 
-def align_features(X, columns):
-    return X.reindex(columns=columns)
+    if dates_all.isna().any():
+        raise ValueError(
+            f"{dates_all.isna().sum()} inspection dates are invalid."
+        )
+
+    # Unknown future outcomes cannot be used for supervised learning.
+    valid_mask = y_frame[TARGET].isin([0, 1])
+
+    unknown_count = int((~valid_mask).sum())
+
+    X = X_all.loc[valid_mask].reset_index(drop=True)
+
+    y = (
+        y_frame.loc[valid_mask, TARGET]
+        .astype(int)
+        .reset_index(drop=True)
+    )
+
+    dates = (
+        dates_all.loc[valid_mask]
+        .reset_index(drop=True)
+    )
+
+    feature_columns = [
+        col for col in X.columns
+        if col not in EXCLUDE_FEATURES
+    ]
+
+    X = X[feature_columns].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    invalid_columns = X.columns[
+        X.isna().any()
+    ].tolist()
+
+    if invalid_columns:
+        raise ValueError(
+            "Missing or non-numeric feature values detected: "
+            f"{invalid_columns}"
+        )
+
+    if not set(y.unique()).issubset({0, 1}):
+        raise ValueError("Target must contain only 0 and 1.")
+
+    print("=" * 65)
+    print("DATASET SUMMARY")
+    print("=" * 65)
+
+    print("Original records:", len(X_all))
+    print("Known targets:", len(X))
+    print("Unknown targets excluded:", unknown_count)
+    print("Number of features:", len(feature_columns))
+
+    print(
+        "Inspection date range:",
+        dates.min().date(),
+        "to",
+        dates.max().date(),
+    )
+
+    print("\nTarget distribution:")
+    print(y.value_counts().sort_index())
+
+    print(f"\nFailure rate: {y.mean():.2%}")
+
+    return X, y, dates, feature_columns
 
 
-for path in [TRAIN_PATH, TEST_PATH, LABELLED_PATH, SCORING_PATH]:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing {path}. Run target.py and split_data.py first.")
+# ============================================================
+# 3. CHRONOLOGICAL TRAIN / VALIDATION / TEST SPLIT
+# ============================================================
 
-train_df = read_dates(TRAIN_PATH)
-test_df = read_dates(TEST_PATH)
-all_df = read_dates(LABELLED_PATH)
-scoring_df = pd.read_csv(SCORING_PATH, parse_dates=["Inspection Date"], low_memory=False)
+def chronological_split(X, y, dates):
 
-for name, frame in [("train", train_df), ("test", test_df), ("all labelled", all_df)]:
-    if TARGET not in frame:
-        raise ValueError(f"{name} dataset does not contain {TARGET}; rerun target.py.")
-    if frame[TARGET].isna().any() or not set(frame[TARGET].unique()).issubset({0, 1}):
-        raise ValueError(f"{name} target is missing or not binary.")
+    # Sort by inspection date.
+    order = np.argsort(
+        dates.to_numpy(),
+        kind="stable",
+    )
 
-if train_df["Next_Routine_Inspection_Date"].max() >= TEST_START:
-    raise ValueError("Train targets cross into the test period.")
-if test_df["Next_Routine_Inspection_Date"].min() < TEST_START:
-    raise ValueError("Test targets begin before the test boundary.")
+    X = X.iloc[order].reset_index(drop=True)
+    y = y.iloc[order].reset_index(drop=True)
+    dates = dates.iloc[order].reset_index(drop=True)
 
-# Chronological fit/validation split inside the pre-test data.
-fit_df = train_df[train_df["Next_Routine_Inspection_Date"] < VALIDATION_START].copy()
-val_df = train_df[
-    (train_df["Next_Routine_Inspection_Date"] >= VALIDATION_START)
-    & (train_df["Next_Routine_Inspection_Date"] < TEST_START)
-].copy()
-if fit_df.empty or val_df.empty:
-    raise ValueError("Fit/validation split is empty; check date boundaries.")
+    n = len(X)
 
-X_fit, y_fit = make_X(fit_df), fit_df[TARGET].astype(int)
-X_val, y_val = make_X(val_df), val_df[TARGET].astype(int)
-X_test, y_test = make_X(test_df), test_df[TARGET].astype(int)
-feature_cols = X_fit.columns.tolist()
-for name, X in [("validation", X_val), ("test", X_test)]:
-    if set(X.columns) != set(feature_cols):
-        missing = sorted(set(feature_cols) - set(X.columns))
-        extra = sorted(set(X.columns) - set(feature_cols))
-        raise ValueError(f"Feature mismatch in {name}. Missing={missing}; extra={extra}")
-X_val = align_features(X_val, feature_cols)
-X_test = align_features(X_test, feature_cols)
+    train_end = int(n * TRAIN_FRACTION)
 
-print(f"Rows: fit={len(fit_df):,}; validation={len(val_df):,}; test={len(test_df):,}")
-print("Failure rates:", round(y_fit.mean(), 4), round(y_val.mean(), 4), round(y_test.mean(), 4))
-print("Features before encoding:", len(feature_cols))
+    validation_end = int(
+        n * (TRAIN_FRACTION + VALIDATION_FRACTION)
+    )
 
-# No class_weight: balanced weights often distort probability estimates.
-# Upgraded hyperparameters! Increased tree depth and estimators 
-# so XGBoost & Random Forest can capture deeper, more complex risk patterns.
-models = {
-    "Logistic Regression": LogisticRegression(
-        max_iter=500, tol=1e-3, solver="liblinear", random_state=RANDOM_STATE
-    ),
-    "Random Forest": RandomForestClassifier(
-        n_estimators=250, max_depth=16, min_samples_leaf=5, max_features="sqrt",
-        n_jobs=-1, random_state=RANDOM_STATE,
-    ),
-    # TEAM NOTE: scale_pos_weight = neg/pos so XGBoost pays more attention to the rarer Fail class
-    "XGBoost": XGBClassifier(
-        n_estimators=300, max_depth=6, learning_rate=0.03,
-        subsample=0.80, colsample_bytree=0.80, reg_lambda=1.0,
-        min_child_weight=3, eval_metric="logloss", tree_method="hist",
-        scale_pos_weight=float((y_fit == 0).sum() / max(1, (y_fit == 1).sum())),
-        n_jobs=-1, random_state=RANDOM_STATE,
-    ),
-}
+    # Date cutoffs avoid splitting records with the same date
+    # across different datasets.
+    train_cutoff = dates.iloc[train_end]
+    validation_cutoff = dates.iloc[validation_end]
 
-validation_rows = []
-fitted = {}
+    train_mask = dates < train_cutoff
 
-# Ranking baselines. Scores are rankings, not calibrated probabilities.
-if "Results" in X_val:
-    row = {"Model": "Current inspection result baseline"}
-    row.update(safe_metrics(y_val, pd.to_numeric(X_val["Results"], errors="coerce").fillna(0)))
-    validation_rows.append(row)
-if "Last_Canvass_Failed" in X_val:
-    row = {"Model": "Last Canvass result baseline"}
-    row.update(safe_metrics(y_val, pd.to_numeric(X_val["Last_Canvass_Failed"], errors="coerce").fillna(0)))
-    validation_rows.append(row)
+    validation_mask = (
+        (dates >= train_cutoff)
+        & (dates < validation_cutoff)
+    )
 
-# Constant training prevalence baseline for probability calibration context.
-constant_val = np.full(len(y_val), float(y_fit.mean()))
-row = {"Model": "Constant training prevalence baseline"}
-row.update(safe_metrics(y_val, constant_val))
-validation_rows.append(row)
+    test_mask = dates >= validation_cutoff
 
-for name, estimator in models.items():
-    print(f"\nFitting validation model: {name}")
-    pipe = make_pipeline(estimator, X_fit)
-    pipe.fit(X_fit, y_fit)
-    val_prob = pipe.predict_proba(X_val)[:, 1]
-    row = {"Model": name}
-    row.update(safe_metrics(y_val, val_prob))
-    validation_rows.append(row)
-    fitted[name] = pipe
+    if not (
+        train_mask.any()
+        and validation_mask.any()
+        and test_mask.any()
+    ):
+        raise ValueError(
+            "One of the chronological datasets is empty."
+        )
 
-validation_report = pd.DataFrame(validation_rows)
-model_mask = validation_report["Model"].isin(models.keys())
-validation_report.loc[model_mask, "PR_AUC_Rank"] = validation_report.loc[model_mask, "PR_AUC"].rank(ascending=False, method="average")
-validation_report.loc[model_mask, "Brier_Rank"] = validation_report.loc[model_mask, "Brier_Score"].rank(ascending=True, method="average")
-validation_report.loc[model_mask, "Combined_Rank"] = validation_report.loc[model_mask, ["PR_AUC_Rank", "Brier_Rank"]].mean(axis=1)
-validation_report.to_csv(OUTPUT_DIR / "model_validation_comparison.csv", index=False)
-print("\nValidation comparison (models selected by mean PR-AUC/Brier rank):")
-print(validation_report.sort_values("Combined_Rank", na_position="last").to_string(index=False))
+    X_train = X.loc[train_mask].reset_index(drop=True)
+    y_train = y.loc[train_mask].reset_index(drop=True)
 
-ml_report = validation_report[model_mask].sort_values("Combined_Rank")
-best_name = str(ml_report.iloc[0]["Model"])
-print("\nSelected model:", best_name)
+    X_val = X.loc[validation_mask].reset_index(drop=True)
+    y_val = y.loc[validation_mask].reset_index(drop=True)
 
-# Honest test evaluation: base estimator fits only on early fit data; sigmoid
-# calibration uses the validation period; the test set is untouched until now.
-# TEAM NOTE: Calibrate EVERY candidate on validation, score once on untouched test.
-# Deployment still uses validation winner only (best_name). This makes the Streamlit
-# Model & SHAP table show LR / RF / XGB side-by-side for the professor demo.
-test_rows = []
-calibrated_models = {}
-for name, pipe in fitted.items():
-    cal_model = calibrate_prefit(pipe, X_val, y_val)
-    calibrated_models[name] = cal_model
-    probs = cal_model.predict_proba(X_test)[:, 1]
-    row = {"Model": f"{name} (sigmoid-calibrated)"}
-    row.update(safe_metrics(y_test, probs))
-    test_rows.append(row)
+    X_test = X.loc[test_mask].reset_index(drop=True)
+    y_test = y.loc[test_mask].reset_index(drop=True)
 
-# Keep a handle on the validation-selected model for test_predictions export
-calibrated_eval_model = calibrated_models[best_name]
-test_prob = calibrated_eval_model.predict_proba(X_test)[:, 1]
+    test_dates = dates.loc[test_mask].reset_index(drop=True)
 
-# Compare against ranking baselines and a constant-probability Brier baseline.
-if "Results" in X_test:
-    row = {"Model": "Current inspection result baseline"}
-    row.update(safe_metrics(y_test, pd.to_numeric(X_test["Results"], errors="coerce").fillna(0)))
-    test_rows.append(row)
-if "Last_Canvass_Failed" in X_test:
-    row = {"Model": "Last Canvass result baseline"}
-    row.update(safe_metrics(y_test, pd.to_numeric(X_test["Last_Canvass_Failed"], errors="coerce").fillna(0)))
-    test_rows.append(row)
-row = {"Model": "Constant training prevalence baseline"}
-row.update(safe_metrics(y_test, np.full(len(y_test), float(train_df[TARGET].mean()))))
-test_rows.append(row)
+    print("\n" + "=" * 65)
+    print("CHRONOLOGICAL DATA SPLIT")
+    print("=" * 65)
 
-test_report = pd.DataFrame(test_rows)
-# Sort to make the dashboard table look clean
-test_report = test_report.sort_values(by="PR_AUC", ascending=False)
-test_report.to_csv(OUTPUT_DIR / "model_test_metrics.csv", index=False)
+    for name, mask in [
+        ("Training", train_mask),
+        ("Validation", validation_mask),
+        ("Test", test_mask),
+    ]:
+        split_dates = dates.loc[mask]
+        split_y = y.loc[mask]
 
-prediction_cols = [c for c in ["Restaurant_ID", "Inspection Date", "Next_Routine_Inspection_Date"] if c in test_df]
-test_predictions = test_df[prediction_cols].copy()
-test_predictions["Actual_Next_Routine_Failure"] = y_test.to_numpy()
-test_predictions["Predicted_Failure_Probability"] = test_prob
-test_predictions.to_csv(OUTPUT_DIR / "test_predictions.csv", index=False)
-joblib.dump(calibrated_eval_model, OUTPUT_DIR / "restaurant_failure_evaluation_model.joblib")
+        print(
+            f"{name}: {len(split_dates):,} records "
+            f"({len(split_dates) / n:.1%}) | "
+            f"{split_dates.min().date()} to "
+            f"{split_dates.max().date()} | "
+            f"Failure rate: {split_y.mean():.2%}"
+        )
 
-print("\nHeld-out test comparison:")
-print(test_report.to_string(index=False))
-print("Saved evaluation model and test predictions.")
+    return (
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
+        test_dates,
+    )
 
-# -------------------------- Deployment model --------------------------
-# After the honest test evaluation, train a separate model for current scoring.
-# The most recent 18 months of target outcomes are reserved for calibration.
-max_target_date = all_df["Next_Routine_Inspection_Date"].max()
-deploy_cal_start = max_target_date - pd.Timedelta(days=MAX_CALIBRATION_DAYS)
-deploy_fit_df = all_df[all_df["Next_Routine_Inspection_Date"] < deploy_cal_start].copy()
-deploy_cal_df = all_df[all_df["Next_Routine_Inspection_Date"] >= deploy_cal_start].copy()
-if deploy_fit_df.empty or deploy_cal_df.empty:
-    raise ValueError("Deployment fit/calibration split is empty. Check target date range.")
-if deploy_fit_df[TARGET].nunique() < 2 or deploy_cal_df[TARGET].nunique() < 2:
-    raise ValueError("Deployment fit and calibration sets must each contain both target classes.")
 
-X_deploy_fit, y_deploy_fit = make_X(deploy_fit_df), deploy_fit_df[TARGET].astype(int)
-X_deploy_cal, y_deploy_cal = make_X(deploy_cal_df), deploy_cal_df[TARGET].astype(int)
-X_score = make_X(scoring_df)
-deploy_features = X_deploy_fit.columns.tolist()
-for name, X in [("deployment calibration", X_deploy_cal), ("scoring", X_score)]:
-    X = X.reindex(columns=deploy_features)
-    if name == "deployment calibration":
-        X_deploy_cal = X
-    else:
-        X_score = X
+# ============================================================
+# 4. DEFINE MODELS
+# ============================================================
 
-# Clone a fresh estimator of the selected family; do not reuse the evaluation fit.
-from sklearn.base import clone
-deploy_estimator = clone(models[best_name])
-deploy_base = make_pipeline(deploy_estimator, X_deploy_fit)
-deploy_base.fit(X_deploy_fit, y_deploy_fit)
-deployment_model = calibrate_prefit(deploy_base, X_deploy_cal, y_deploy_cal)
+def create_models():
 
-score_prob = deployment_model.predict_proba(X_score)[:, 1]
-queue = scoring_df[[c for c in ["Restaurant_ID", "Inspection Date", "Risk", "Latitude", "Longitude", "Results", "Last_Canvass_Failed", "Days_Since_Last_Failure", "Violation_Count", "Hazard_Count"] if c in scoring_df]].copy()
-queue["Predicted_Failure_Probability"] = score_prob
-queue["Priority_Rank"] = queue["Predicted_Failure_Probability"].rank(method="first", ascending=False).astype(int)
-rank_percentile = queue["Predicted_Failure_Probability"].rank(method="first", ascending=False, pct=True)
-queue["Relative_Risk_Tier"] = np.select(
-    [rank_percentile <= 0.10, rank_percentile <= 0.30],
-    ["Red - highest 10%", "Yellow - next 20%"],
-    default="Green - remaining 70%",
-)
-queue = queue.sort_values("Predicted_Failure_Probability", ascending=False)
-queue.to_csv(OUTPUT_DIR / "restaurant_risk_priority_queue.csv", index=False)
-joblib.dump(deployment_model, OUTPUT_DIR / "restaurant_failure_model.joblib")
-# Save the uncalibrated base pipeline separately for feature attribution / SHAP.
-joblib.dump(deploy_base, OUTPUT_DIR / "restaurant_failure_base_estimator.joblib")
+    return {
+        "RandomForest": RandomForestClassifier(
+            n_estimators=250,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        ),
 
-# Extracting clean feature names post-preprocessing so SHAP plots 
-# in the next script have accurate labels instead of raw array indices.
-try:
-    transformed_feature_names = deploy_base.named_steps["preprocess"].get_feature_names_out().tolist()
-except Exception:
-    transformed_feature_names = deploy_features
+        "ExtraTrees": ExtraTreesClassifier(
+            n_estimators=250,
+            min_samples_leaf=2,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        ),
 
-metadata = {
-    "selected_model": best_name,
-    "target": TARGET,
-    "target_definition": "failure at next Canvass inspection after current event; intervening event types allowed",
-    "minimum_target_gap_days": 1,
-    "maximum_target_gap_days": MAX_CALIBRATION_DAYS,
-    "deployment_calibration_start": str(deploy_cal_start.date()),
-    "deployment_calibration_end": str(max_target_date.date()),
-    "feature_columns": deploy_features,
-    "transformed_feature_names": transformed_feature_names,  # Added for SHAP!
-    "risk_tiers": "relative ranking: top 10% red, next 20% yellow, remaining 70% green",
-}
-joblib.dump(metadata, OUTPUT_DIR / "restaurant_failure_model_metadata.joblib")
-print("\nDeployment model saved:", OUTPUT_DIR / "restaurant_failure_model.joblib")
-print("Priority queue saved:", OUTPUT_DIR / "restaurant_risk_priority_queue.csv")
-print("Deployment fit rows:", len(deploy_fit_df), "calibration rows:", len(deploy_cal_df))
-print("Scored latest restaurants:", len(queue))
-print("Risk tier counts:\n", queue["Relative_Risk_Tier"].value_counts())
+        "HistGradientBoosting": HistGradientBoostingClassifier(
+            max_iter=150,
+            learning_rate=0.08,
+            max_leaf_nodes=31,
+            l2_regularization=1.0,
+            random_state=RANDOM_STATE,
+        ),
+    }
+
+
+# ============================================================
+# 5. TRAIN MODELS AND SELECT USING VALIDATION PR-AUC
+# ============================================================
+
+def train_models(X_train, y_train, X_val, y_val):
+
+    results = []
+    trained_models = {}
+    validation_probabilities = {}
+
+    for name, estimator in create_models().items():
+
+        print("\n" + "=" * 65)
+        print("TRAINING:", name)
+        print("=" * 65)
+
+        model = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("classifier", estimator),
+        ])
+
+        model.fit(X_train, y_train)
+
+        probabilities = model.predict_proba(X_val)[:, 1]
+
+        predictions = (
+            probabilities >= 0.50
+        ).astype(int)
+
+        metrics = {
+            "model": name,
+
+            "validation_accuracy": accuracy_score(
+                y_val, predictions
+            ),
+
+            "validation_precision": precision_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "validation_recall": recall_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "validation_f1": f1_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "validation_pr_auc": average_precision_score(
+                y_val, probabilities
+            ),
+
+            "validation_roc_auc": (
+                roc_auc_score(y_val, probabilities)
+                if y_val.nunique() > 1
+                else float("nan")
+            ),
+        }
+
+        results.append(metrics)
+        trained_models[name] = model
+        validation_probabilities[name] = probabilities
+
+        for metric, value in metrics.items():
+            if metric != "model":
+                print(f"{metric}: {value:.4f}")
+
+    comparison = pd.DataFrame(results).sort_values(
+        "validation_pr_auc",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    comparison.to_csv(
+        OUTPUT_DIR / "model_comparison.csv",
+        index=False,
+    )
+
+    best_name = comparison.iloc[0]["model"]
+
+    best_model = trained_models[best_name]
+
+    best_probabilities = validation_probabilities[best_name]
+
+    print("\nMODEL COMPARISON")
+    print(comparison.to_string(index=False))
+
+    print(
+        f"\nBest model by validation PR-AUC: {best_name}"
+    )
+
+    return best_name, best_model, best_probabilities, comparison
+
+
+# ============================================================
+# 6. SELECT THRESHOLD USING VALIDATION DATA
+# ============================================================
+
+def tune_thresholds(y_val, probabilities):
+
+    results = []
+
+    for threshold in THRESHOLDS:
+
+        predictions = (
+            probabilities >= threshold
+        ).astype(int)
+
+        tn, fp, fn, tp = confusion_matrix(
+            y_val,
+            predictions,
+            labels=[0, 1],
+        ).ravel()
+
+        results.append({
+            "Threshold": threshold,
+
+            "Accuracy": accuracy_score(
+                y_val, predictions
+            ),
+
+            "Precision": precision_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "Recall": recall_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "F1": f1_score(
+                y_val, predictions, zero_division=0
+            ),
+
+            "True_Negatives": int(tn),
+            "False_Positives": int(fp),
+            "False_Negatives": int(fn),
+            "True_Positives": int(tp),
+
+            "Predicted_Failures": int(
+                predictions.sum()
+            ),
+
+            "PR_AUC": average_precision_score(
+                y_val, probabilities
+            ),
+        })
+
+    threshold_table = pd.DataFrame(results)
+
+    threshold_table.to_csv(
+        OUTPUT_DIR / "validation_threshold_comparison.csv",
+        index=False,
+    )
+
+    # Choose the threshold with the highest validation F1.
+    # Ties prefer higher recall, then higher precision.
+    ranked = threshold_table.sort_values(
+        ["F1", "Recall", "Precision"],
+        ascending=[False, False, False],
+    )
+
+    best_row = ranked.iloc[0]
+
+    selected_threshold = float(
+        best_row["Threshold"]
+    )
+
+    print("\n" + "=" * 65)
+    print("VALIDATION THRESHOLD COMPARISON")
+    print("=" * 65)
+
+    print(
+        threshold_table.round(4).to_string(index=False)
+    )
+
+    print(
+        f"\nSelected threshold: {selected_threshold:.2f}"
+    )
+
+    print(
+        f"Validation precision: {best_row['Precision']:.4f}"
+    )
+
+    print(
+        f"Validation recall: {best_row['Recall']:.4f}"
+    )
+
+    print(
+        f"Validation F1: {best_row['F1']:.4f}"
+    )
+
+    return selected_threshold, threshold_table
+
+
+# ============================================================
+# 7. FINAL TEST EVALUATION
+# ============================================================
+
+def evaluate_test(
+    model,
+    X_test,
+    y_test,
+    test_dates,
+    threshold,
+):
+
+    # Test data is not used for model or threshold selection.
+    probabilities = model.predict_proba(X_test)[:, 1]
+
+    predictions = (
+        probabilities >= threshold
+    ).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_test,
+        predictions,
+        labels=[0, 1],
+    ).ravel()
+
+    metrics = {
+        "selected_threshold": float(threshold),
+
+        "test_accuracy": float(
+            accuracy_score(y_test, predictions)
+        ),
+
+        "test_precision": float(
+            precision_score(
+                y_test, predictions, zero_division=0
+            )
+        ),
+
+        "test_recall": float(
+            recall_score(
+                y_test, predictions, zero_division=0
+            )
+        ),
+
+        "test_f1": float(
+            f1_score(
+                y_test, predictions, zero_division=0
+            )
+        ),
+
+        "test_pr_auc": float(
+            average_precision_score(
+                y_test, probabilities
+            )
+        ),
+
+        "test_roc_auc": float(
+            roc_auc_score(y_test, probabilities)
+            if y_test.nunique() > 1
+            else float("nan")
+        ),
+
+        "true_negatives": int(tn),
+        "false_positives": int(fp),
+        "false_negatives": int(fn),
+        "true_positives": int(tp),
+
+        "predicted_failures": int(
+            predictions.sum()
+        ),
+    }
+
+    test_predictions = pd.DataFrame({
+        "Inspection_Date": test_dates.to_numpy(),
+        "Actual_Next_Results": y_test.to_numpy(),
+        "Failure_Probability": probabilities,
+        "Predicted_Next_Results": predictions,
+        "Threshold_Used": threshold,
+    })
+
+    test_predictions.to_csv(
+        OUTPUT_DIR / "test_predictions.csv",
+        index=False,
+    )
+
+    with open(
+        OUTPUT_DIR / "test_metrics.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(metrics, file, indent=2)
+
+    print("\n" + "=" * 65)
+    print("FINAL TEST RESULTS")
+    print("=" * 65)
+
+    for key, value in metrics.items():
+        print(f"{key}: {value}")
+
+    print("\nConfusion matrix [[TN, FP], [FN, TP]]:")
+    print(
+        confusion_matrix(
+            y_test,
+            predictions,
+            labels=[0, 1],
+        )
+    )
+
+    print("\nClassification report:")
+    print(
+        classification_report(
+            y_test,
+            predictions,
+            zero_division=0,
+        )
+    )
+
+    return metrics
+
+
+# ============================================================
+# 8. SAVE MODEL AND METADATA
+# ============================================================
+
+def save_artifacts(
+    best_name,
+    best_model,
+    selected_threshold,
+    comparison,
+    threshold_table,
+    feature_columns,
+    test_metrics,
+):
+
+    joblib.dump(
+        best_model,
+        OUTPUT_DIR / "best_restaurant_failure_model.joblib",
+    )
+
+    selected_row = threshold_table.loc[
+        threshold_table["Threshold"] == selected_threshold
+    ].iloc[0].to_dict()
+
+    metadata = {
+        "best_model": str(best_name),
+
+        "selection_metric": "Validation PR-AUC",
+
+        "threshold_selection_metric": "Validation F1",
+
+        "selected_threshold": selected_threshold,
+
+        "target": TARGET,
+
+        "feature_columns": feature_columns,
+
+        "split": {
+            "method": "chronological",
+            "train_fraction_target": TRAIN_FRACTION,
+            "validation_fraction_target": VALIDATION_FRACTION,
+            "test_fraction_target": TEST_FRACTION,
+        },
+
+        "selected_validation_threshold_metrics": selected_row,
+
+        "final_test_metrics": test_metrics,
+
+        "notes": [
+            "Unknown targets were excluded from supervised modeling.",
+            "Model selection used validation PR-AUC.",
+            "Threshold selection used validation F1.",
+            "Test data was reserved for final evaluation.",
+            "The saved model is fitted on the training split only.",
+            "Historical feature engineering must be audited for leakage.",
+        ],
+    }
+
+    with open(
+        OUTPUT_DIR / "model_metadata.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(metadata, file, indent=2, default=float)
+
+    print("\nSaved artifacts:")
+
+    for filename in [
+        "model_comparison.csv",
+        "validation_threshold_comparison.csv",
+        "test_predictions.csv",
+        "test_metrics.json",
+        "model_metadata.json",
+        "best_restaurant_failure_model.joblib",
+    ]:
+        print(OUTPUT_DIR / filename)
+
+
+# ============================================================
+# 9. MAIN
+# ============================================================
+
+def main():
+
+    X, y, dates, feature_columns = load_data()
+
+    (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        test_dates,
+    ) = chronological_split(X, y, dates)
+
+    (
+        best_name,
+        best_model,
+        validation_probabilities,
+        comparison,
+    ) = train_models(
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+    )
+
+    selected_threshold, threshold_table = tune_thresholds(
+        y_val,
+        validation_probabilities,
+    )
+
+    test_metrics = evaluate_test(
+        best_model,
+        X_test,
+        y_test,
+        test_dates,
+        selected_threshold,
+    )
+
+    save_artifacts(
+        best_name,
+        best_model,
+        selected_threshold,
+        comparison,
+        threshold_table,
+        feature_columns,
+        test_metrics,
+    )
+
+    print("\nModel-building pipeline completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
